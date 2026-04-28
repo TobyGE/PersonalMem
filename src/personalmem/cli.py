@@ -2,6 +2,7 @@
 
 Subcommands:
     init                                  # write default config
+    onboard                                # (re)pick LLM provider
     start                                  # start the capture daemon (background)
     stop                                   # stop the capture daemon
     status                                 # show daemon + capture status
@@ -532,6 +533,19 @@ def cmd_start(args) -> int:
         cfg_path.write_text(oc_config.DEFAULT_CONFIG_TEMPLATE)
         print(f"first run: wrote default config → {cfg_path}", file=sys.stderr)
 
+    # First-run onboarding (interactive only — no-ops in non-TTY shells).
+    from . import onboard
+    if onboard.needs_onboarding():
+        try:
+            onboard.run_onboarding()
+        except (KeyboardInterrupt, EOFError):
+            print("\nonboarding cancelled — run `personalmem onboard` to retry",
+                  file=sys.stderr)
+            return 1
+        except Exception as e:  # noqa: BLE001
+            print(f"onboarding failed: {e}", file=sys.stderr)
+            return 1
+
     cfg = oc_config.load(cfg_path)
     pid = _read_pid()
     if pid:
@@ -568,6 +582,15 @@ def cmd_stop(args) -> int:
         return 1
     os.kill(pid, signal.SIGTERM)
     print(f"sent SIGTERM to pid {pid}", file=sys.stderr)
+    return 0
+
+
+def cmd_onboard(args) -> int:
+    from . import onboard
+    ran = onboard.run_onboarding(force=True)
+    if not ran:
+        print("onboarding skipped (non-interactive shell)", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -628,6 +651,9 @@ def main() -> int:
 
     sp_status = sub.add_parser("status", help="show daemon + data status")
     sp_status.set_defaults(func=cmd_status)
+
+    sp_onb = sub.add_parser("onboard", help="(re)pick LLM provider")
+    sp_onb.set_defaults(func=cmd_onboard)
 
     args = ap.parse_args()
     return args.func(args)

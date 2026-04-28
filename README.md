@@ -17,10 +17,16 @@ One Markdown file per topic. All data lives at `~/.personalmem/`.
 git clone https://github.com/TobyGE/PersonalMem.git ~/PersonalMem
 cd ~/PersonalMem
 uv tool install --editable .   # one-time install; `personalmem` is on $PATH
-personalmem start              # starts the capture daemon
+personalmem start              # first run: pick provider, then daemon starts
 ```
 
-That's it. The default config gets written on first run.
+On first run you'll be asked to pick an LLM provider:
+
+- **Ollama** — local, free
+- **Anthropic API key** — paste an `sk-ant-...`
+- **Anthropic OAuth** — Claude.com Pro/Max subscription (browser-based PKCE)
+
+Re-run anytime with `personalmem onboard`.
 
 When you want to turn captures into topic threads:
 
@@ -51,7 +57,7 @@ personalmem run --since X --until Y --reset           # rerun a window
 
 Edit `~/.personalmem/config.toml`. Key sections:
 
-- **`[models.default]`** — LLM provider. Defaults to local `ollama/qwen2.5:14b`. Switch to Anthropic / OpenAI / Gemini by changing `model =` and setting `api_key_env =`. Any [litellm](https://github.com/BerriAI/litellm)-supported provider works.
+- **`[models.default]`** — LLM provider, written by `personalmem onboard`. Hand-edit to switch to OpenAI / Gemini / any other [litellm](https://github.com/BerriAI/litellm)-supported provider.
 - **`[capture]`** — AX capture knobs (heartbeat, debounce, retention, screenshot toggle)
 - **`[router]`** — top-K open threads shown to router
 - **`[storage]`** — where outputs land

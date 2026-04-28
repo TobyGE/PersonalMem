@@ -12,5 +12,6 @@ data/*.db-wal
 data/threads-replay-*/
 data/runs/
 .env
-anthropic_oauth.py
-src/personalmem/llm/anthropic_oauth.py
+
+# OAuth tokens (written by `personalmem onboard`)
+oauth-tokens.json
