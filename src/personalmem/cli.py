@@ -524,7 +524,15 @@ def _read_pid() -> int | None:
 
 
 def cmd_start(args) -> int:
-    cfg = oc_config.load(Path(args.config).expanduser() if args.config else None)
+    # Auto-init: first run lays down the default config so users don't
+    # have to remember `personalmem init` before `personalmem start`.
+    cfg_path = Path(args.config).expanduser() if args.config else oc_config.default_config_path()
+    if not cfg_path.exists():
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(oc_config.DEFAULT_CONFIG_TEMPLATE)
+        print(f"first run: wrote default config → {cfg_path}", file=sys.stderr)
+
+    cfg = oc_config.load(cfg_path)
     pid = _read_pid()
     if pid:
         print(f"already running (pid {pid})", file=sys.stderr)
