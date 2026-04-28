@@ -122,7 +122,7 @@ def load_pruned_text(
     has been screenshot-stripped or evicted by retention policy).
     """
     if buffer_dir is None:
-        buffer_dir = Path.home() / ".openchronicle" / "capture-buffer"
+        buffer_dir = Path.home() / ".personalmem" / "capture-buffer"
     json_path = buffer_dir / f"{capture_id}.json"
     if not json_path.exists():
         return fallback
@@ -192,7 +192,7 @@ def load_sub_context(
 ) -> str:
     """Load capture JSON and return its sub-context (or '' if unavailable)."""
     if buffer_dir is None:
-        buffer_dir = Path.home() / ".openchronicle" / "capture-buffer"
+        buffer_dir = Path.home() / ".personalmem" / "capture-buffer"
     json_path = buffer_dir / f"{capture_id}.json"
     if not json_path.exists():
         return ""

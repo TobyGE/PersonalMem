@@ -1,8 +1,9 @@
-"""LLM dispatcher: routes calls to litellm or to direct Anthropic OAuth.
+"""LLM dispatcher: thin wrapper around litellm.
 
-``call_llm(cfg, stage, messages=...)`` returns a litellm-shaped response
-object (``.choices[0].message.content``) regardless of which backend handled
-the call, so callers don't need to special-case auth.
+``call_llm(cfg, stage, messages=...)`` returns a litellm response object
+(``.choices[0].message.content``). Use any provider litellm supports —
+ollama, openai, anthropic (api key), gemini, etc. — by setting
+``model``, ``api_key`` / ``api_key_env``, and ``base_url`` in config.
 """
 
 from __future__ import annotations
@@ -25,26 +26,12 @@ def call_llm(
 ) -> Any:
     """Invoke the configured model for a stage. Returns litellm-shaped response.
 
-    Dispatches by ``model_cfg.auth_type``:
-    - ``"anthropic_oauth"`` → direct call via ``llm/anthropic_oauth.py``
-      (subscription auth, reads token from GuardClaw's storage)
-    - empty → litellm with api_key/api_key_env
-
     Mock mode (for tests): ``PERSONALMEM_LLM_MOCK=1`` returns a stub.
     """
     if os.environ.get("PERSONALMEM_LLM_MOCK") == "1":
         return _mock_response()
 
     model_cfg = cfg.model_for(stage)
-
-    if model_cfg.auth_type == "anthropic_oauth":
-        from . import anthropic_oauth
-        max_tokens = model_cfg.max_tokens or 4096
-        return anthropic_oauth.call_anthropic_oauth(
-            model=model_cfg.model,
-            messages=messages,
-            max_tokens=max_tokens,
-        )
 
     import litellm  # lazy
     kwargs: dict[str, Any] = {

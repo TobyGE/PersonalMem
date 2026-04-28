@@ -22,7 +22,26 @@ class ModelConfig:
     api_key_env: str = ""
     max_tokens: int | None = None
     num_ctx: int | None = None       # ollama-only: input context window
-    auth_type: str = ""              # "" → litellm; "anthropic_oauth" → direct OAuth
+
+
+@dataclass
+class CaptureConfig:
+    """Live AX-capture daemon knobs."""
+    event_driven: bool = True
+    heartbeat_minutes: int = 10
+    debounce_seconds: float = 3.0
+    min_capture_gap_seconds: float = 2.0
+    dedup_interval_seconds: float = 1.0
+    same_window_dedup_seconds: float = 5.0
+    interval_minutes: int = 10
+    buffer_retention_hours: int = 168
+    screenshot_retention_hours: int = 24
+    buffer_max_mb: int = 2000
+    include_screenshot: bool = True
+    screenshot_max_width: int = 1920
+    screenshot_jpeg_quality: int = 80
+    ax_depth: int = 100
+    ax_timeout_seconds: int = 3
 
 
 @dataclass
@@ -52,6 +71,7 @@ class StorageConfig:
 @dataclass
 class Config:
     models: dict[str, ModelConfig] = field(default_factory=dict)
+    capture: CaptureConfig = field(default_factory=CaptureConfig)
     coalesce: CoalesceConfig = field(default_factory=CoalesceConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
     source: CaptureSourceConfig = field(default_factory=CaptureSourceConfig)
@@ -104,6 +124,7 @@ def load(path: Path | None = None) -> Config:
             raw = tomllib.load(f)
     return Config(
         models=_build_models(_as_dict(raw.get("models"))),
+        capture=_build(CaptureConfig, _as_dict(raw.get("capture"))),
         coalesce=_build(CoalesceConfig, _as_dict(raw.get("coalesce"))),
         router=_build(RouterConfig, _as_dict(raw.get("router"))),
         source=_build(CaptureSourceConfig, _as_dict(raw.get("source"))),
@@ -119,27 +140,49 @@ DEFAULT_CONFIG_TEMPLATE = """\
 # PersonalMem configuration
 
 # ─── Models ─────────────────────────────────────────────────────────────────
-# Default model used by stages that don't specify their own.
+# Any provider litellm supports works. Examples:
+#
+# Local Ollama (free, runs on your machine):
 [models.default]
-model = "claude-haiku-4-5-20251001"
-auth_type = "anthropic_oauth"   # uses GuardClaw's stored Claude OAuth token
+model = "ollama/qwen2.5:14b"
+num_ctx = 32768
 max_tokens = 2048
+#
+# Anthropic API (paid):
+# [models.default]
+# model = "anthropic/claude-haiku-4-5-20251001"
+# api_key_env = "ANTHROPIC_API_KEY"
+# max_tokens = 2048
+#
+# OpenAI:
+# [models.default]
+# model = "gpt-4o-mini"
+# api_key_env = "OPENAI_API_KEY"
+# max_tokens = 2048
 
 # Stage overrides — uncomment to use different models per stage.
 # [models.thread_router]
-# model = "claude-haiku-4-5-20251001"
-# auth_type = "anthropic_oauth"
-# max_tokens = 2048
-
+# model = "ollama/qwen2.5:7b"
+# num_ctx = 32768
+#
 # [models.thread_summarizer]
-# model = "claude-haiku-4-5-20251001"
-# auth_type = "anthropic_oauth"
-# max_tokens = 2048
-
-# Or use Ollama locally:
-# [models.thread_router]
 # model = "ollama/qwen2.5:14b"
 # num_ctx = 32768
+
+# ─── Capture daemon ────────────────────────────────────────────────────────
+[capture]
+event_driven = true
+heartbeat_minutes = 10
+debounce_seconds = 3.0
+min_capture_gap_seconds = 2.0
+dedup_interval_seconds = 1.0
+same_window_dedup_seconds = 5.0
+buffer_retention_hours = 168
+screenshot_retention_hours = 24
+buffer_max_mb = 2000
+include_screenshot = true
+ax_depth = 100
+ax_timeout_seconds = 3
 
 # ─── Pipeline knobs ────────────────────────────────────────────────────────
 [coalesce]
@@ -149,10 +192,11 @@ gap_seconds = 60
 top_k = 10
 
 # ─── Data source: where raw AX captures live ──────────────────────────────
-# Default points at OpenChronicle's daemon output. PersonalMem only reads.
+# By default reads from PersonalMem's own daemon. Point at another
+# OpenChronicle install if you want to re-process its captures.
 [source]
-index_db = "~/.openchronicle/index.db"
-capture_buffer_dir = "~/.openchronicle/capture-buffer"
+index_db = "~/.personalmem/index.db"
+capture_buffer_dir = "~/.personalmem/capture-buffer"
 
 # ─── Storage: where PersonalMem writes thread state and outputs ────────────
 [storage]

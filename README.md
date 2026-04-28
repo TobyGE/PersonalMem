@@ -1,16 +1,16 @@
 # PersonalMem
 
-Topic-thread routing + summarization on top of OpenChronicle's AX captures.
+A self-contained "personal memory" pipeline for macOS.
 
 ## What it does
 
-1. Reads raw screen captures from OpenChronicle's daemon (`~/.openchronicle/index.db` + `capture-buffer/`)
-2. Coalesces near-duplicate captures (same app/window within 60s)
-3. Routes each surviving capture into a topic thread via LLM
-4. Summarizes each thread once routing is complete
+1. **Captures** screen activity via macOS Accessibility API (own daemon, own data dir at `~/.personalmem/`)
+2. **Coalesces** near-duplicate captures (same app/window within 60s, sub-context aware for chat apps)
+3. **Routes** each surviving capture into a topic thread via LLM (router sees the full activity history of each open thread, not just titles or summaries)
+4. **Summarizes** each thread once routing is complete — title, narrative, key events, outcome
 5. Writes one Markdown file per thread
 
-PersonalMem only **reads** OpenChronicle's data — it doesn't run its own capture daemon.
+PersonalMem is fully standalone: it has its own AX-watcher subprocess, its own `index.db`, its own `capture-buffer/`. No external daemon required.
 
 ## Setup
 
@@ -20,19 +20,31 @@ uv venv
 source .venv/bin/activate
 uv pip install -e .
 
-# Write default config
-personalmem init
+# Build the AX-watcher Swift binaries (needs Xcode CLT)
+bash resources/build-mac-ax-watcher.sh
+bash resources/build-mac-ax-helper.sh
 
-# Edit ~/.personalmem/config.toml as needed (model + auth)
+# Write default config + start the capture daemon
+personalmem init
+personalmem start
 ```
 
-## Run
+## Daemon control
 
 ```bash
-# Replay everything since the daemon started
+personalmem start         # daemon in background
+personalmem start -f      # foreground (Ctrl+C to stop)
+personalmem stop          # SIGTERM
+personalmem status        # daemon state + capture count
+```
+
+## Routing replay
+
+```bash
+# Replay everything in the index
 personalmem run
 
-# Specific window
+# A specific window
 personalmem run --since 2026-04-26T19:11 --until 2026-04-26T20:09
 
 # Wipe state and re-run
@@ -44,16 +56,17 @@ Output goes to `~/.personalmem/threads/thr_*.md` (one file per topic).
 ## Config
 
 `~/.personalmem/config.toml` controls:
-- **`[models.*]`**: which model handles routing vs. summarization. Supports Anthropic OAuth (Haiku/Sonnet via Claude.com subscription, no API key) or any litellm-supported provider (Ollama / OpenAI / etc.)
-- **`[coalesce]`**: dedup window
-- **`[router]`**: top-K open threads shown per decision
-- **`[source]`**: where to read AX captures from
-- **`[storage]`**: where PersonalMem writes its own state
-
-## Auth (Anthropic OAuth)
-
-When `auth_type = "anthropic_oauth"`, PersonalMem reads the OAuth token stored by [GuardClaw](https://github.com/Einsia/GuardClaw) at `~/.guardclaw/oauth-tokens.json`. Run GuardClaw and authenticate Claude once; the token auto-refreshes.
+- **`[models.*]`**: LLM provider per stage (router, summarizer). Any provider [litellm](https://github.com/BerriAI/litellm) supports — Ollama (local, free), OpenAI, Anthropic API, Gemini.
+- **`[capture]`**: AX capture daemon knobs (heartbeat interval, debounce, dedup windows, screenshot retention)
+- **`[coalesce]`**: pre-routing dedup window
+- **`[router]`**: top-K open threads shown to router per decision
+- **`[source]`**: where to read captures from (defaults to PersonalMem's own paths)
+- **`[storage]`**: where outputs land
 
 ## Status
 
-This is extracted from in-flight experimental work. The default v14 pipeline (`coalesce → route → summarize`) produces clean topic threads on hour-scale workloads. Multi-day scaling and edge-case routing (active-vs-passive activity classification, low-content WeChat captures) are still being tuned.
+Extracted from in-flight experimental work. The default pipeline (`coalesce → route → summarize`) produces clean topic threads on hour-scale workloads. Multi-day scaling and edge-case routing (active-vs-passive activity classification, low-content captures) are still being tuned.
+
+## Acknowledgments
+
+The capture stack — AX tree walking, mac-ax-watcher / mac-ax-helper Swift binaries, S1 markdown rendering, screenshot capture — is ported from [OpenChronicle](https://github.com/Einsia/OpenChronicle).

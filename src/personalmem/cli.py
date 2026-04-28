@@ -1,30 +1,33 @@
-"""PersonalMem CLI — replay AX captures into topic threads.
+"""PersonalMem CLI.
 
-Reads raw AX captures from the configured source (default = OpenChronicle's
-``index.db`` + ``capture-buffer/``), routes each capture into a topic thread
-via LLM, then summarizes each thread once routing is complete.
-
-Usage:
-    personalmem run                                     # replay everything since last run
-    personalmem run --since 2026-04-26T19:11            # replay from specific time
-    personalmem run --since ... --until ... --reset     # full re-run on a window
-    personalmem init                                    # write default config
+Subcommands:
+    init                                  # write default config
+    start                                  # start the capture daemon (background)
+    stop                                   # stop the capture daemon
+    status                                 # show daemon + capture status
+    run                                    # replay captures into topic threads
+        --since YYYY-MM-DDTHH:MM           # window start
+        --until YYYY-MM-DDTHH:MM           # window end
+        --limit N                          # cap number of captures
+        --reset                            # wipe threads_db before run
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import signal
 import sqlite3
 import sys
 import time
-from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from . import config as oc_config
-from .ax import pruner as ax_pruner
+from . import paths
+from .capture import ax_pruner
 from .pipeline import router as thread_router
 from .pipeline import summarizer as thread_summarizer
 from .pipeline.router import CaptureView
@@ -501,6 +504,94 @@ def cmd_init(args) -> int:
     return 0
 
 
+# ─── daemon: start / stop / status ─────────────────────────────────────────
+
+
+def _read_pid() -> int | None:
+    pf = paths.pid_file()
+    if not pf.exists():
+        return None
+    try:
+        pid = int(pf.read_text().strip())
+    except ValueError:
+        return None
+    # Verify process is alive
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    return pid
+
+
+def cmd_start(args) -> int:
+    cfg = oc_config.load(Path(args.config).expanduser() if args.config else None)
+    pid = _read_pid()
+    if pid:
+        print(f"already running (pid {pid})", file=sys.stderr)
+        return 1
+
+    from . import daemon
+
+    if args.foreground:
+        print("PersonalMem capture daemon starting in foreground — Ctrl+C to stop.",
+              file=sys.stderr)
+        daemon.run(cfg)
+        return 0
+
+    # Background: double-fork → fully detached daemon
+    if os.fork() != 0:
+        print("PersonalMem started in background.", file=sys.stderr)
+        print(f"Logs: {paths.logs_dir()}", file=sys.stderr)
+        return 0
+    os.setsid()
+    if os.fork() != 0:
+        os._exit(0)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    daemon.run(cfg)
+    os._exit(0)
+
+
+def cmd_stop(args) -> int:
+    pid = _read_pid()
+    if not pid:
+        print("daemon not running", file=sys.stderr)
+        return 1
+    os.kill(pid, signal.SIGTERM)
+    print(f"sent SIGTERM to pid {pid}", file=sys.stderr)
+    return 0
+
+
+def cmd_status(args) -> int:
+    pid = _read_pid()
+    print(f"  Root          {paths.root()}")
+    print(f"  Daemon        {'running (pid ' + str(pid) + ')' if pid else 'stopped'}")
+    buf = paths.capture_buffer_dir()
+    if buf.exists():
+        files = sorted(buf.glob("*.json"))
+        last = files[-1].stem if files else "(none)"
+        print(f"  Buffer        {len(files)} files, last: {last}")
+    else:
+        print(f"  Buffer        (no buffer dir yet)")
+    db = paths.index_db()
+    if db.exists():
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            (n_caps,) = conn.execute("SELECT COUNT(*) FROM captures").fetchone()
+            try:
+                (n_threads,) = conn.execute("SELECT COUNT(*) FROM threads").fetchone()
+            except sqlite3.OperationalError:
+                n_threads = 0
+            print(f"  Captures      {n_caps}")
+            print(f"  Threads       {n_threads}")
+        except sqlite3.Error as e:
+            print(f"  DB error      {e}")
+    else:
+        print(f"  Captures      (no index.db yet)")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="personalmem")
     ap.add_argument("--config", default=None,
@@ -518,6 +609,17 @@ def main() -> int:
     sp_init = sub.add_parser("init", help="write default config.toml")
     sp_init.add_argument("--force", action="store_true")
     sp_init.set_defaults(func=cmd_init)
+
+    sp_start = sub.add_parser("start", help="start the capture daemon")
+    sp_start.add_argument("-f", "--foreground", action="store_true",
+                          help="run in this terminal instead of double-forking")
+    sp_start.set_defaults(func=cmd_start)
+
+    sp_stop = sub.add_parser("stop", help="stop the capture daemon")
+    sp_stop.set_defaults(func=cmd_stop)
+
+    sp_status = sub.add_parser("status", help="show daemon + data status")
+    sp_status.set_defaults(func=cmd_status)
 
     args = ap.parse_args()
     return args.func(args)

@@ -12,7 +12,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Iterable
 
-from ..ax import pruner as ax_pruner
+from ..capture import ax_pruner
 from ..config import Config
 import logging
 from ..store.threads import Thread
