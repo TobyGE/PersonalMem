@@ -13,16 +13,19 @@ import os
 import signal
 from contextlib import suppress
 
+from . import logger as logger_mod
 from . import paths
 from .capture import scheduler as capture_scheduler
 from .config import Config
-from .logger import get
 
-logger = get("personalmem.daemon")
+logger = logger_mod.get("personalmem.daemon")
 
 
 async def _run(cfg: Config) -> None:
     paths.ensure_dirs()
+    # Initialize file-based loggers so we get diagnostics in daemon mode
+    # (stderr is /dev/null after the double-fork). Call once at startup.
+    logger_mod.setup(console=False)
     paths.pid_file().write_text(str(os.getpid()))
 
     tasks: list[asyncio.Task] = [

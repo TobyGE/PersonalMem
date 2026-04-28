@@ -91,7 +91,7 @@ def prune_ax_app(app_data: dict[str, Any]) -> str:
         title = win.get("title") or "(untitled)"
         lines.append(f"### {title}")
         for el in win.get("elements", []):
-            _walk(el, lines, depth=0)
+            _walk(el, lines, depth=0, ancestor_sigs=frozenset())
     return "\n".join(lines)
 
 
@@ -206,7 +206,12 @@ def load_sub_context(
     return extract_sub_context(ax_tree)
 
 
-def _walk(el: dict[str, Any], lines: list[str], depth: int) -> None:
+def _walk(
+    el: dict[str, Any],
+    lines: list[str],
+    depth: int,
+    ancestor_sigs: frozenset[tuple[str, str, str]] = frozenset(),
+) -> None:
     title = (el.get("title") or "").strip()
     value = (el.get("value") or "").strip()
     role = (el.get("role") or "").replace("AX", "")
@@ -215,12 +220,24 @@ def _walk(el: dict[str, Any], lines: list[str], depth: int) -> None:
     if role == "Button" and is_chrome_button(title):
         return
 
+    # Ancestor-duplicate guard: drop any node whose (role, title, value)
+    # matches any ancestor in the current chain. Outlook's AX tree wraps
+    # the same TextField recursively 100+ levels deep with identical
+    # value (and the same set of sibling buttons at every level), so
+    # rendering those subtrees produces the same buttons repeated 100+
+    # times. Stop recursion entirely on ancestor-dup hits — the subtree
+    # is guaranteed redundant with what we've already rendered or are
+    # about to render at the parent's level.
+    sig = (role, title, value)
+    if sig in ancestor_sigs:
+        return
+
     if len(children) == 1:
         child = children[0]
         child_title = (child.get("title") or "").strip()
         child_value = (child.get("value") or "").strip()
         if child_title == title and not value and not child_value:
-            _walk(child, lines, depth)
+            _walk(child, lines, depth, ancestor_sigs)
             return
 
     texts: list[str] = []
@@ -234,8 +251,35 @@ def _walk(el: dict[str, Any], lines: list[str], depth: int) -> None:
         if role and role not in ("StaticText", "Group"):
             text = f"[{role}] {text}"
         lines.append("  " * depth + "- " + text)
-        for c in children:
-            _walk(c, lines, depth + 1)
+        new_ancestors = ancestor_sigs | {sig}
+        _walk_children(children, lines, depth + 1, new_ancestors)
     elif children:
-        for c in children:
-            _walk(c, lines, depth)
+        _walk_children(children, lines, depth, ancestor_sigs)
+
+
+# Cap how many children of a single parent we render. Lists / tables
+# (Outlook inbox, browser tab strip, file explorer) commonly have 50-200
+# rows of similar shape — even after dedup, that's huge. We render the
+# first N and append a one-line "(K more hidden)" so the LLM knows the
+# total count without paying for every entry.
+_MAX_CHILDREN_PER_PARENT = 30
+
+
+def _walk_children(
+    children: list[dict[str, Any]],
+    lines: list[str],
+    depth: int,
+    ancestor_sigs: frozenset[tuple[str, str, str]],
+) -> None:
+    rendered = 0
+    skipped = 0
+    for c in children:
+        if rendered >= _MAX_CHILDREN_PER_PARENT:
+            skipped += 1
+            continue
+        before = len(lines)
+        _walk(c, lines, depth, ancestor_sigs)
+        if len(lines) > before:
+            rendered += 1
+    if skipped:
+        lines.append("  " * depth + f"- … ({skipped} more children hidden)")

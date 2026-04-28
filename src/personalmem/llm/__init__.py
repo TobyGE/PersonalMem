@@ -33,6 +33,27 @@ def call_llm(
 
     model_cfg = cfg.model_for(stage)
 
+    # Auto-detect Anthropic OAuth: if the model is Claude-family AND no
+    # api_key is configured, try the local subscription-auth helper. The
+    # helper module is gitignored — present only on machines where the
+    # user has wired up GuardClaw / Claude.com OAuth — so a graceful
+    # ImportError falls through to the standard litellm path.
+    if (
+        "claude-" in model_cfg.model.lower()
+        and not resolve_api_key(model_cfg)
+    ):
+        try:
+            from . import anthropic_oauth
+        except ImportError:
+            anthropic_oauth = None
+        if anthropic_oauth is not None:
+            model_name = model_cfg.model.split("/", 1)[-1]  # strip optional "anthropic/" prefix
+            return anthropic_oauth.call_anthropic_oauth(
+                model=model_name,
+                messages=messages,
+                max_tokens=model_cfg.max_tokens or 4096,
+            )
+
     import litellm  # lazy
     kwargs: dict[str, Any] = {
         "model": model_cfg.model,

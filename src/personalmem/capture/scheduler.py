@@ -56,6 +56,10 @@ def _build_capture(
         "app_name": meta.app_name,
         "title": meta.title,
         "bundle_id": meta.bundle_id,
+        "window_bounds": (
+            {"x": meta.x, "y": meta.y, "width": meta.width, "height": meta.height}
+            if meta.has_bounds else None
+        ),
     }
 
     if provider.available:
@@ -67,8 +71,13 @@ def _build_capture(
         out["ax_unavailable"] = True
 
     if cfg.include_screenshot:
+        crop_to: tuple[int, int, int, int] | None = None
+        if cfg.screenshot_active_window_only and meta.has_bounds:
+            crop_to = (meta.x, meta.y, meta.width, meta.height)
         shot = screenshot.grab(
-            max_width=cfg.screenshot_max_width, jpeg_quality=cfg.screenshot_jpeg_quality
+            max_width=cfg.screenshot_max_width,
+            jpeg_quality=cfg.screenshot_jpeg_quality,
+            crop_to=crop_to,
         )
         if shot is not None:
             out["screenshot"] = {
@@ -76,6 +85,7 @@ def _build_capture(
                 "mime_type": shot.mime_type,
                 "width": shot.width,
                 "height": shot.height,
+                "cropped_to_window": crop_to is not None,
             }
 
     s1_parser.enrich(out)
