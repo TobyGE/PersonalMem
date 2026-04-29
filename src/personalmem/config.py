@@ -51,6 +51,12 @@ class CaptureConfig:
     screenshot_ax_sparse_threshold: int = 200
     screenshot_max_width: int = 1280
     screenshot_jpeg_quality: int = 80
+    # Run Apple Vision OCR on each captured screenshot (only when a
+    # screenshot was taken — i.e. when AX was sparse). The extracted
+    # text lands in capture["vision_ocr"]["text"] for routing/summarizer
+    # consumption. Cheap (~50-100ms per shot) and entirely local.
+    ocr_enabled: bool = True
+    ocr_min_confidence: float = 0.5
     ax_depth: int = 100
     ax_timeout_seconds: int = 3
 
@@ -200,6 +206,9 @@ screenshot_mode = "auto"
 screenshot_ax_sparse_threshold = 200
 screenshot_max_width = 1280
 screenshot_jpeg_quality = 80
+# OCR each captured screenshot via Apple Vision (mac-vision-ocr binary).
+ocr_enabled = true
+ocr_min_confidence = 0.5
 ax_depth = 100
 ax_timeout_seconds = 3
 

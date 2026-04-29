@@ -17,7 +17,7 @@ from .. import paths
 from ..config import CaptureConfig
 from ..logger import get
 from ..store import fts as fts_store
-from . import ax_capture, ax_pruner, s1_parser, screenshot, window_meta
+from . import ax_capture, ax_pruner, s1_parser, screenshot, vision_ocr, window_meta
 from .event_dispatcher import EventDispatcher
 from .watcher import AXWatcherProcess
 
@@ -111,6 +111,17 @@ def _build_capture(
                 "width": shot.width,
                 "height": shot.height,
             }
+            # Apple Vision OCR on the just-captured frame. We screenshot
+            # exactly because AX is sparse — OCR is the substitute signal
+            # source for the routing/summarizer pipeline.
+            if cfg.ocr_enabled:
+                import base64
+                ocr = vision_ocr.run_ocr(
+                    base64.b64decode(shot.image_base64),
+                    min_confidence=cfg.ocr_min_confidence,
+                )
+                if ocr is not None and ocr["text"]:
+                    out["vision_ocr"] = ocr
 
     s1_parser.enrich(out)
     return out
