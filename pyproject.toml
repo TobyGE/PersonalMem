@@ -9,9 +9,8 @@ description = "Topic-thread routing + summarization on top of OpenChronicle's AX
 requires-python = ">=3.12"
 dependencies = [
     "litellm>=1.50",                  # LLM dispatch (ollama / openai / anthropic / gemini / etc)
-    "mss>=9.0",                       # screenshot grabbing (multi-monitor aware)
-    "Pillow>=10.0",                   # JPEG encoding for screenshots
-    "pyobjc-framework-Quartz>=10.0",  # window bounds via CGWindowListCopyWindowInfo (macOS only)
+    "Pillow>=10.0",                   # PNG→JPEG re-encode for screenshots
+    "pyobjc-framework-Quartz>=10.0",  # window-bounds enrichment in capture metadata (macOS only)
 ]
 
 [project.scripts]

@@ -66,17 +66,19 @@ Edit `~/.personalmem/config.toml`. Key sections:
 
 On first run macOS will prompt for **Accessibility** (so AX can read app UIs). Grant once.
 
-If you flip `include_screenshot = true`, you'll also need **Screen Recording** permission. Run `personalmem start -f` once so the prompt appears (background-launched daemons can't show prompts).
+Screenshots are on by default and use **ScreenCaptureKit** (the bundled `mac-frontcap` binary) to grab just the active window — no popup-picker mis-targeting. macOS will also prompt for **Screen Recording** permission on first run; run `personalmem start -f` once so the prompt appears (background-launched daemons can't show prompts). Set `include_screenshot = false` in config to skip screenshots entirely.
 
 ## Rebuilding the Swift binaries (rare)
 
-The `mac-ax-watcher` and `mac-ax-helper` binaries ship pre-compiled in `resources/`. You only need to rebuild if you're modifying the Swift sources:
+The `mac-ax-watcher`, `mac-ax-helper`, and `mac-frontcap` binaries ship pre-compiled in `resources/`. You only need to rebuild if you're modifying the Swift sources:
 
 ```bash
 bash resources/build-mac-ax-watcher.sh
 bash resources/build-mac-ax-helper.sh
+bash resources/build-mac-frontcap.sh
 ```
 
 ## Acknowledgments
 
-The capture stack (AX tree walking, mac-ax-watcher / mac-ax-helper Swift binaries, S1 markdown rendering) is ported from [OpenChronicle](https://github.com/Einsia/OpenChronicle).
+- The AX capture stack (mac-ax-watcher / mac-ax-helper Swift binaries, S1 markdown rendering) is ported from [OpenChronicle](https://github.com/Einsia/OpenChronicle).
+- The `mac-frontcap` ScreenCaptureKit-based window grabber is adapted from [openAGIAgent](https://github.com/) (FrontCap.swift).

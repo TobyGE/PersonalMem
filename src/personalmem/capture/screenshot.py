@@ -1,10 +1,27 @@
-"""Screenshot capture via mss + PIL. Extracted from Einsia-Partner capture_service.py."""
+"""Screenshot capture via the bundled ``mac-frontcap`` Swift binary.
+
+The binary uses ``ScreenCaptureKit`` (macOS 12.3+) to grab the frontmost
+window directly — no full-screen mss grab + Quartz-bounds crop math, no
+Retina scale dance, and no popup-picker mis-targeting (which is why the
+old mss-based path was disabled by default).
+
+The capture path is:
+
+    mac-frontcap <tmpdir> <maxSide>   # writes one PNG, prints its path
+    → re-encode PNG → JPEG (Pillow)
+    → base64-encode for embedding in the capture JSON
+"""
 
 from __future__ import annotations
 
 import base64
 import io
+import os
+import platform
+import subprocess
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 from ..logger import get
 
@@ -19,99 +36,101 @@ class Screenshot:
     height: int = 0
 
 
-def grab(
-    max_width: int = 1920,
-    jpeg_quality: int = 80,
-    *,
-    crop_to: tuple[int, int, int, int] | None = None,
-) -> Screenshot | None:
-    """Capture the primary monitor and return a base64-encoded JPEG.
+def _resolve_frontcap_path() -> Path | None:
+    """Find or build the mac-frontcap binary.
 
-    ``crop_to``: optional (x, y, width, height) in logical points (the same
-    coordinate system the macOS AppleScript ``position`` / ``size`` of a
-    window returns). When provided, the captured frame is cropped to that
-    rectangle so the resulting image is just the active window — much
-    less noise for downstream LLM consumption than a full-screen frame
-    cluttered with other apps and the menu bar.
+    Search order mirrors the AX-binary helpers:
+      1. PERSONALMEM_FRONTCAP env override
+      2. Packaged resource (_bundled/) shipped with a wheel
+      3. Dev source tree (../../../resources/)
     """
+    if platform.system() != "Darwin":
+        return None
+
+    override = os.environ.get("PERSONALMEM_FRONTCAP")
+    if override:
+        p = Path(override).expanduser().resolve()
+        if p.is_file() and os.access(p, os.X_OK):
+            return p
+        logger.warning("PERSONALMEM_FRONTCAP set but not executable: %s", p)
+
+    candidates: list[Path] = []
     try:
-        import mss
+        from importlib.resources import files as _pkg_files
+
+        bundled_dir = Path(str(_pkg_files("personalmem").joinpath("_bundled")))
+        candidates.append(bundled_dir / "mac-frontcap")
+    except (ModuleNotFoundError, ValueError):
+        pass
+
+    dev_root = Path(__file__).resolve().parents[3]
+    candidates.append(dev_root / "resources" / "mac-frontcap")
+
+    for binary_path in candidates:
+        swift_path = binary_path.with_suffix(".swift")
+        if swift_path.is_file():
+            from .ax_capture import _maybe_compile  # lazy: avoid import cycle
+            _maybe_compile(swift_path, binary_path)
+        if binary_path.is_file() and os.access(binary_path, os.X_OK):
+            return binary_path
+
+    return None
+
+
+def grab(
+    max_width: int = 1280,
+    jpeg_quality: int = 80,
+) -> Screenshot | None:
+    """Capture the frontmost window and return a base64-encoded JPEG.
+
+    ``max_width`` is passed to mac-frontcap as ``maxSide`` — the longer
+    side of the captured window is downscaled to fit. We then re-encode
+    to JPEG for storage compactness (PNGs of UI screenshots are 5-10×
+    larger than visually equivalent JPEGs).
+    """
+    binary = _resolve_frontcap_path()
+    if binary is None:
+        logger.warning(
+            "mac-frontcap not found. Build it: bash resources/build-mac-frontcap.sh"
+        )
+        return None
+
+    try:
         from PIL import Image
     except ImportError as exc:
-        logger.warning("mss/Pillow not installed: %s", exc)
+        logger.warning("Pillow not installed: %s", exc)
         return None
 
-    try:
-        with mss.mss() as sct:
-            monitors = sct.monitors
-            if len(monitors) < 2:
-                logger.warning("No monitors reported by mss")
-                return None
-            mon = monitors[1]  # index 0 is the "all monitors" virtual screen
-            raw = sct.grab(mon)
-            img = Image.frombytes("RGB", raw.size, raw.rgb)
-    except Exception as exc:  # noqa: BLE001 — mss can raise a variety of OS errors
-        logger.warning("Screenshot grab failed: %s", exc)
-        return None
-
-    if crop_to is not None:
-        img = _crop_to_window(img, mon, crop_to)
-        if img is None:
+    with tempfile.TemporaryDirectory(prefix="personalmem-shot-") as tmpdir:
+        try:
+            result = subprocess.run(
+                [str(binary), tmpdir, str(max_width)],
+                capture_output=True, text=True, timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("mac-frontcap timed out")
+            return None
+        except OSError as exc:
+            logger.warning("mac-frontcap exec failed: %s", exc)
             return None
 
-    if max_width and img.width > max_width:
-        ratio = max_width / img.width
-        new_size = (max_width, int(img.height * ratio))
-        img = img.resize(new_size, Image.Resampling.LANCZOS)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            logger.warning("mac-frontcap rc=%d: %s", result.returncode, stderr)
+            return None
 
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
-    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
-    return Screenshot(image_base64=encoded, width=img.width, height=img.height)
+        png_path = Path((result.stdout or "").strip())
+        if not png_path.is_file():
+            logger.warning("mac-frontcap returned bad path: %r", result.stdout)
+            return None
 
+        try:
+            img = Image.open(png_path).convert("RGB")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to read PNG from mac-frontcap: %s", exc)
+            return None
 
-def _crop_to_window(img, mon: dict, crop_to: tuple[int, int, int, int]):
-    """Crop an mss-captured image to a window rect given in logical points.
-
-    mss returns physical pixels; AppleScript window bounds are logical points.
-    On Retina displays these differ by the display's backing scale (typically
-    2x). We infer scale from the ratio of the captured image's pixel width to
-    the monitor's logical width as reported by mss.
-    """
-    from PIL import Image  # already imported but keep module-local
-
-    x_pt, y_pt, w_pt, h_pt = crop_to
-    if w_pt <= 0 or h_pt <= 0:
-        logger.warning("crop_to had non-positive size %s; returning full frame", crop_to)
-        return img
-
-    mon_width = mon.get("width") or img.width
-    mon_height = mon.get("height") or img.height
-    # mss's "left"/"top" for monitor[1] are 0-based for primary on macOS;
-    # window position is also relative to the same origin.
-    mon_left = mon.get("left", 0)
-    mon_top = mon.get("top", 0)
-
-    # Scale from logical points → physical pixels. If mss already returns
-    # logical (some setups), scale will be ~1.
-    scale_x = img.width / mon_width if mon_width else 1
-    scale_y = img.height / mon_height if mon_height else 1
-
-    px = int(round((x_pt - mon_left) * scale_x))
-    py = int(round((y_pt - mon_top) * scale_y))
-    pw = int(round(w_pt * scale_x))
-    ph = int(round(h_pt * scale_y))
-
-    # Clamp to image bounds
-    px = max(0, px)
-    py = max(0, py)
-    right = min(img.width, px + pw)
-    bottom = min(img.height, py + ph)
-    if right <= px or bottom <= py:
-        logger.warning(
-            "crop rect (%d,%d,%d,%d) outside image %dx%d; falling back to full frame",
-            px, py, pw, ph, img.width, img.height,
-        )
-        return img
-
-    return img.crop((px, py, right, bottom))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return Screenshot(image_base64=encoded, width=img.width, height=img.height)

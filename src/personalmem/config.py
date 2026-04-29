@@ -37,18 +37,13 @@ class CaptureConfig:
     buffer_retention_hours: int = 168
     screenshot_retention_hours: int = 24
     buffer_max_mb: int = 2000
-    # Screenshot capture is OFF by default. Enabling it works for most apps
-    # but cropping to the active window via Quartz CGWindowList sometimes
-    # picks up tooltips / status bar overlays / picker windows instead of
-    # the main window (especially for Chrome with extension popups). Until
-    # the window-picking heuristic is robust, AX text + visible_text alone
-    # already give the LLM enough context.
-    include_screenshot: bool = False
-    screenshot_max_width: int = 1920
+    # Screenshot capture is on by default — driven by the bundled
+    # ``mac-frontcap`` binary which targets the frontmost window via
+    # ScreenCaptureKit (no full-screen grab + crop math, no popup-picker
+    # mis-targeting). Set False to skip screenshots entirely.
+    include_screenshot: bool = True
+    screenshot_max_width: int = 1280
     screenshot_jpeg_quality: int = 80
-    # When True, crop the screenshot to the active window's bounds.
-    # Has no effect when ``include_screenshot`` is False.
-    screenshot_active_window_only: bool = True
     ax_depth: int = 100
     ax_timeout_seconds: int = 3
 
@@ -189,9 +184,11 @@ same_window_dedup_seconds = 5.0
 buffer_retention_hours = 168
 screenshot_retention_hours = 24
 buffer_max_mb = 2000
-# Screenshot capture is off by default. AX text gives the LLM enough
-# context for routing/summarization. Enable when window-picker is solid.
-include_screenshot = false
+# Screenshot capture (active window only via ScreenCaptureKit). Set
+# false to skip — AX text alone is enough for most routing decisions.
+include_screenshot = true
+screenshot_max_width = 1280
+screenshot_jpeg_quality = 80
 ax_depth = 100
 ax_timeout_seconds = 3
 
