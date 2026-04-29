@@ -22,9 +22,9 @@ personalmem start              # first run: pick provider, then daemon starts
 
 On first run you'll be asked to pick an LLM provider:
 
-- **Ollama** — local, free
-- **Anthropic API key** — paste an `sk-ant-...`
+- **Ollama** — local, free (probes `localhost:11434`, lists installed models)
 - **Anthropic OAuth** — Claude.com Pro/Max subscription (browser-based PKCE)
+- **API key** — Anthropic / OpenAI / Google Gemini / OpenRouter / Kimi (Moonshot)
 
 Re-run anytime with `personalmem onboard`.
 

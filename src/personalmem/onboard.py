@@ -1,14 +1,15 @@
 """Interactive onboarding: pick an LLM provider on first run.
 
-Three options:
+Menu options:
 
-1. **Ollama** — local, free. Probes ``http://localhost:11434`` and lists
-   installed models.
-2. **Anthropic API key** — paid; user pastes ``sk-ant-...``.
-3. **Anthropic OAuth** — Claude.com Pro/Max subscription via PKCE flow.
-   Tokens land in ``~/.personalmem/oauth-tokens.json`` (mode 0600). The
-   LLM dispatcher auto-detects this file when a Claude-family model is
-   configured without an api_key.
+- **Ollama** — local, free. Probes ``http://localhost:11434``.
+- **API key** — Anthropic / OpenAI / Google Gemini / OpenRouter / Kimi.
+  All routed through litellm; OpenRouter and Kimi go via their
+  OpenAI-compatible endpoints with an explicit ``base_url``.
+- **Anthropic OAuth** — Claude.com Pro/Max subscription via PKCE.
+  Tokens land in ``~/.personalmem/oauth-tokens.json`` (mode 0600); the
+  LLM dispatcher auto-detects them when a Claude-family model has no
+  ``api_key`` set.
 
 The chosen provider is written into ``[models.default]`` of
 ``~/.personalmem/config.toml`` (the rest of the file is preserved). A
@@ -54,6 +55,55 @@ _DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 _DEFAULT_OLLAMA_MODEL = "qwen2.5:14b"
 
 
+# API-key provider table. Mirrors GuardClaw's CloudJudge providers; all
+# entries map to litellm calls (OpenRouter and Kimi via OpenAI-compatible
+# base_url). ``key_hint`` shows expected prefix; ``key_prefix`` validates
+# (None to skip validation).
+_API_KEY_PROVIDERS: dict[str, dict[str, Any]] = {
+    "anthropic": {
+        "label": "Anthropic Claude",
+        "default_model": "anthropic/claude-haiku-4-5-20251001",
+        "key_hint": "sk-ant-...",
+        "key_prefix": "sk-ant-",
+        "extra": {},
+        "url": "https://console.anthropic.com/settings/keys",
+    },
+    "openai": {
+        "label": "OpenAI",
+        "default_model": "gpt-4o-mini",
+        "key_hint": "sk-...",
+        "key_prefix": "sk-",
+        "extra": {},
+        "url": "https://platform.openai.com/api-keys",
+    },
+    "gemini": {
+        "label": "Google Gemini",
+        "default_model": "gemini/gemini-2.0-flash",
+        "key_hint": "AIza...",
+        "key_prefix": "AIza",
+        "extra": {},
+        "url": "https://aistudio.google.com/apikey",
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "default_model": "openrouter/anthropic/claude-haiku-4-5",
+        "key_hint": "sk-or-...",
+        "key_prefix": "sk-or-",
+        "extra": {},
+        "url": "https://openrouter.ai/keys",
+    },
+    "kimi": {
+        "label": "Kimi (Moonshot)",
+        # Use OpenAI-compatible client with explicit base_url.
+        "default_model": "openai/kimi-k2.5",
+        "key_hint": "sk-...",
+        "key_prefix": "sk-",
+        "extra": {"base_url": "https://api.moonshot.ai/v1"},
+        "url": "https://platform.moonshot.ai/console/api-keys",
+    },
+}
+
+
 # ─── Public entry points ─────────────────────────────────────────────────────
 
 
@@ -81,22 +131,33 @@ def run_onboarding(*, force: bool = False) -> bool:
     print("Pick an LLM provider for routing + summarization:")
     print()
     print("  [1] Ollama          local, free, runs on your machine")
-    print("  [2] Anthropic API   paid, fast, needs an sk-ant-... key")
-    print("  [3] Anthropic OAuth Claude.com Pro/Max subscription")
+    print("  [2] Anthropic OAuth Claude.com Pro/Max subscription (PKCE)")
+    print("  [3] Anthropic       API key  (sk-ant-...)")
+    print("  [4] OpenAI          API key  (sk-...)")
+    print("  [5] Google Gemini   API key  (AIza...)")
+    print("  [6] OpenRouter      API key  (sk-or-...)")
+    print("  [7] Kimi / Moonshot API key  (sk-...)")
     print()
 
+    api_key_choices = {
+        "3": "anthropic",
+        "4": "openai",
+        "5": "gemini",
+        "6": "openrouter",
+        "7": "kimi",
+    }
     while True:
-        choice = (input("Choice [1/2/3, default 1]: ").strip() or "1")
-        if choice in ("1", "2", "3"):
+        choice = (input("Choice [1-7, default 1]: ").strip() or "1")
+        if choice in {"1", "2"} or choice in api_key_choices:
             break
-        print("  please enter 1, 2, or 3")
+        print("  please enter 1-7")
 
     if choice == "1":
         block = _onboard_ollama()
     elif choice == "2":
-        block = _onboard_anthropic_key()
-    else:
         block = _onboard_anthropic_oauth()
+    else:
+        block = _onboard_api_key(api_key_choices[choice])
 
     _write_models_default(block)
     flag.touch()
@@ -157,24 +218,35 @@ def _ollama_list_models() -> list[str] | None:
     return [m.get("name", "") for m in data.get("models") or [] if m.get("name")]
 
 
-# ─── Provider: Anthropic API key ─────────────────────────────────────────────
+# ─── Provider: API key (Anthropic / OpenAI / Gemini / OpenRouter / Kimi) ─────
 
 
-def _onboard_anthropic_key() -> dict[str, Any]:
+def _onboard_api_key(provider_id: str) -> dict[str, Any]:
+    p = _API_KEY_PROVIDERS[provider_id]
     print()
-    print("[Anthropic API key]")
-    print("  Get a key at: https://console.anthropic.com/settings/keys")
+    print(f"[{p['label']}]")
+    print(f"  Get a key at: {p['url']}")
     while True:
-        key = getpass.getpass("  Paste sk-ant-... (hidden): ").strip()
-        if key.startswith("sk-ant-"):
-            break
-        print("  expected key starts with 'sk-ant-'; try again")
+        key = getpass.getpass(f"  Paste {p['key_hint']} (hidden): ").strip()
+        if not key:
+            print("  empty; try again")
+            continue
+        if p["key_prefix"] and not key.startswith(p["key_prefix"]):
+            print(f"  expected key starts with {p['key_prefix']!r}; try again")
+            continue
+        break
 
-    return {
-        "model": f"anthropic/{_DEFAULT_ANTHROPIC_MODEL}",
+    print(f"  Default model: {p['default_model']}")
+    custom = input("  Override model name [enter to accept]: ").strip()
+    model = custom or p["default_model"]
+
+    block: dict[str, Any] = {
+        "model": model,
         "api_key": key,
         "max_tokens": 2048,
     }
+    block.update(p["extra"])
+    return block
 
 
 # ─── Provider: Anthropic OAuth ───────────────────────────────────────────────
