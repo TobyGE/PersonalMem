@@ -40,7 +40,11 @@ struct VisionOCR {
 
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
-        request.recognitionLanguages = ["en-US", "zh-Hans", "zh-Hant", "ja-JP"]
+        // Simplified Chinese first dramatically improves CJK recognition
+        // (YouTube subtitles, Chinese chapter overlays) at the cost of
+        // dropping a few pure-English chrome labels from confidence
+        // 1.00 → 0.50 — labels still recognized correctly.
+        request.recognitionLanguages = ["zh-Hans", "en-US"]
         request.usesLanguageCorrection = true
 
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])

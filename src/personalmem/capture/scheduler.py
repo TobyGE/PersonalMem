@@ -32,23 +32,54 @@ def _safe_filename(ts: str) -> str:
     return ts.replace(":", "-").replace("+", "p")
 
 
+# Substring markers in the pruned AX text or window title that strongly
+# indicate the user is consuming media (video / audio / fullscreen
+# canvas) — the actual content lives entirely in pixels, not text, even
+# though the surrounding browser chrome dumps thousands of chars. These
+# override the char-count threshold check.
+_MEDIA_TEXT_MARKERS = (
+    " - Audio playing",                    # Chrome appends this to window title
+    " - Video playing",                    # ditto
+    "To exit full screen",                 # Chrome's fullscreen overlay
+    "Control your music, videos",          # Chrome media-control button
+)
+
+# Compiled URL patterns that mean "user is on a video/canvas page"
+# regardless of how chatty the surrounding AX is.
+_MEDIA_URL_HINTS = (
+    "youtube.com/watch",
+    "youtube.com/shorts",
+    "bilibili.com/video",
+    "bilibili.com/bangumi",
+    "netflix.com/watch",
+    "vimeo.com/",
+    "twitch.tv/",
+    "figma.com/",
+    "tldraw.com/",
+)
+
+
 def _should_screenshot(cfg: CaptureConfig, out: dict[str, Any]) -> bool:
     """Decide whether to fire mac-frontcap for this capture.
 
-    "auto" mode is the cheap-but-targeted policy: skip the screenshot
-    when the AX tree already gives us plenty of text (the common case
-    — terminals, editors, web articles, chat apps), and grab one when
-    AX is essentially empty (video players, Figma, canvas-rendered
-    pages, native renderers) — the only scenarios where text alone
-    leaves the LLM blind.
+    "auto" mode picks the screenshot when the AX tree has no useful
+    content for the routing/summarizer pipeline. Two ways that happens:
+
+    1. **AX is short.** Pruned dump < threshold (the easy case —
+       Figma, video players, native renderers).
+    2. **AX is long but content-empty.** Browsers on video pages dump
+       3 KB+ of chrome (bookmarks, tab strip, extensions) but the
+       actual video frame contributes zero text. We detect this via
+       strong-positive markers (Chrome's "Audio playing" tag, known
+       video-site URL substrings, fullscreen overlay) — any one fires
+       → screenshot, regardless of length.
     """
     mode = cfg.screenshot_mode
     if mode == "never":
         return False
     if mode == "always":
         return True
-    # "auto" — fall back to "always" if AX failed entirely (no tree at
-    # all means we have *nothing*, so a screenshot is even more valuable).
+    # "auto" — fall back to "always" if AX failed entirely.
     ax_tree = out.get("ax_tree")
     if not isinstance(ax_tree, dict):
         return True
@@ -56,7 +87,21 @@ def _should_screenshot(cfg: CaptureConfig, out: dict[str, Any]) -> bool:
         pruned = ax_pruner.prune_ax_tree(ax_tree)
     except Exception:  # noqa: BLE001 — never let pruning failures kill a capture
         return True
-    return len(pruned) < cfg.screenshot_ax_sparse_threshold
+
+    # Length-based "AX is empty" trigger.
+    if len(pruned) < cfg.screenshot_ax_sparse_threshold:
+        return True
+
+    # Strong-positive markers: AX has chars but the chars don't tell
+    # us what the user is actually doing.
+    for marker in _MEDIA_TEXT_MARKERS:
+        if marker in pruned:
+            return True
+    for url_hint in _MEDIA_URL_HINTS:
+        if url_hint in pruned:
+            return True
+
+    return False
 
 
 def _build_capture(
