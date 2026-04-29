@@ -175,8 +175,10 @@ def run_routing(
     log_path: Path,
     sub_context_for: dict[str, str] | None = None,
     buffer_dir: Path | None = None,
+    folded_for_kept: dict[str, list[str]] | None = None,
 ) -> dict:
     sub_context_for = sub_context_for or {}
+    folded_for_kept = folded_for_kept or {}
     decisions: list[dict] = []
     routed = {"continue": 0, "new": 0, "close_and_new": 0, "fallback_first": 0}
 
@@ -225,6 +227,7 @@ def run_routing(
                 cfg, capture=cap, open_threads=open_threads,
                 thread_captures=thread_captures,
                 buffer_dir=buffer_dir,
+                folded_capture_ids=tuple(folded_for_kept.get(cap.id, ())),
             )
         except Exception as e:  # noqa: BLE001
             print(f"  ! router error at {i}: {e}; routing as continue-most-recent",
@@ -443,13 +446,21 @@ def cmd_run(args) -> int:
         if sc:
             sub_context_for[row["id"]] = sc
 
-    kept, _folded = coalesce_runs(
+    kept, folded = coalesce_runs(
         rows, max_gap_seconds=cfg.coalesce.gap_seconds,
         sub_context_for=sub_context_for,
     )
     print(f"coalesce: {raw_count} → {len(kept)} ({raw_count - len(kept)} folded)",
           file=sys.stderr)
     rows = kept
+    # Map kept_capture_id → list of folded capture IDs that collapsed
+    # into it. Used by the router to merge OCR text across the whole
+    # phase — the latest kept frame's OCR is often the sparsest, so
+    # we union the OCR from all folded siblings to get the rich signal
+    # (subtitles, chapter list, etc.) that flashed mid-phase.
+    folded_for_kept: dict[str, list[str]] = {
+        row["id"]: list(folded[i]) for i, row in enumerate(kept)
+    }
 
     log_path = out_dir / "_decisions.json"
     t0 = time.monotonic()
@@ -458,6 +469,7 @@ def cmd_run(args) -> int:
         top_k=cfg.router.top_k, log_path=log_path,
         sub_context_for=sub_context_for,
         buffer_dir=buffer_dir,
+        folded_for_kept=folded_for_kept,
     )
     routing_stats["routing_seconds"] = round(time.monotonic() - t0, 1)
 

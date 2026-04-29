@@ -12,7 +12,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Iterable
 
-from ..capture import ax_pruner
+from ..capture import ax_pruner, vision_ocr
 from ..config import Config
 import logging
 from ..store.threads import Thread
@@ -89,12 +89,44 @@ def _render_thread_context(
             lines.append(f"      [{ts_short}] {c.app or '?'} — {c.window_title or ''}")
             if c.focused_value:
                 lines.append(f"        user_text: {c.focused_value!r}")
-            pruned = ax_pruner.load_pruned_text(c.id, buffer_dir=buffer_dir, fallback=c.visible_text or "")
+            # History captures: just their own pruned AX + own OCR.
+            # Folded siblings (if any) were already merged in when this
+            # capture was the focal one of its phase.
+            pruned = _visible_text_for(
+                c.id, buffer_dir=buffer_dir, fallback=c.visible_text or "",
+            )
             if pruned:
                 lines.append(f"        visible_text: {pruned!r}")
             if c.url:
                 lines.append(f"        url: {c.url}")
     return "\n".join(lines) if lines else "(none — no threads currently open)"
+
+
+def _visible_text_for(
+    capture_id: str,
+    *,
+    buffer_dir: Path | None,
+    fallback: str,
+    extra_capture_ids: tuple[str, ...] = (),
+) -> str:
+    """Pruned AX text for the focal capture + OCR text merged across the
+    capture and any folded-by-coalesce siblings (line-level dedup with
+    fuzzy matching for OCR jitter).
+
+    Combining is just concatenation with a section break: the LLM
+    handles a "[OCR]:" header fine.
+    """
+    pruned = ax_pruner.load_pruned_text(
+        capture_id, buffer_dir=buffer_dir, fallback=fallback,
+    )
+    ocr = vision_ocr.merge_ocr_texts(
+        (capture_id, *extra_capture_ids), buffer_dir=buffer_dir,
+    )
+    if not ocr:
+        return pruned
+    if not pruned:
+        return f"[OCR]:\n{ocr}"
+    return f"{pruned}\n\n[OCR]:\n{ocr}"
 
 
 def route(
@@ -104,6 +136,7 @@ def route(
     open_threads: list[Thread],
     thread_captures: dict[str, list[CaptureView]] | None = None,
     buffer_dir: Path | None = None,
+    folded_capture_ids: tuple[str, ...] = (),
 ) -> RouteDecision:
     """Ask the LLM where this capture belongs.
 
@@ -117,11 +150,16 @@ def route(
     thread_captures = thread_captures or {}
     template = _load_prompt()
 
-    # No length truncation on the new-capture block. Use AX-pruned
-    # visible_text (chrome stripped) so chat-message bodies / verbatim
-    # quotes the router needs for topic judgment actually reach the LLM.
-    pruned_visible = ax_pruner.load_pruned_text(
-        capture.id, buffer_dir=buffer_dir, fallback=capture.visible_text or ""
+    # No length truncation on the new-capture block. Pruned AX (chrome
+    # stripped) plus OCR text merged across the focal capture and any
+    # folded-by-coalesce siblings, so videos/canvas captures aren't
+    # blind and ephemeral OCR signals (subtitle that flashed in frame 2
+    # but not frame 5) survive to the LLM.
+    pruned_visible = _visible_text_for(
+        capture.id,
+        buffer_dir=buffer_dir,
+        fallback=capture.visible_text or "",
+        extra_capture_ids=tuple(folded_capture_ids),
     )
     rendered = template.format(
         open_threads_block=_render_thread_context(open_threads, thread_captures, buffer_dir=buffer_dir),
