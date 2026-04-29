@@ -37,11 +37,18 @@ class CaptureConfig:
     buffer_retention_hours: int = 168
     screenshot_retention_hours: int = 24
     buffer_max_mb: int = 2000
-    # Screenshot capture is on by default — driven by the bundled
-    # ``mac-frontcap`` binary which targets the frontmost window via
-    # ScreenCaptureKit (no full-screen grab + crop math, no popup-picker
-    # mis-targeting). Set False to skip screenshots entirely.
-    include_screenshot: bool = True
+    # Screenshot capture mode:
+    #   "auto"   (default) — only when AX text is sparse (videos / canvas
+    #                        apps / Figma / PDF readers etc.) where the
+    #                        AX tree alone tells us nothing useful.
+    #   "always"           — every capture (overkill for most apps; AX is
+    #                        usually enough on its own).
+    #   "never"            — disable screenshots entirely.
+    screenshot_mode: str = "auto"
+    # In "auto" mode, screenshot fires when the pruned AX text is shorter
+    # than this many characters. 200 is roughly the threshold between
+    # "AX rendered enough text to route on" and "AX is essentially empty".
+    screenshot_ax_sparse_threshold: int = 200
     screenshot_max_width: int = 1280
     screenshot_jpeg_quality: int = 80
     ax_depth: int = 100
@@ -184,9 +191,13 @@ same_window_dedup_seconds = 5.0
 buffer_retention_hours = 168
 screenshot_retention_hours = 24
 buffer_max_mb = 2000
-# Screenshot capture (active window only via ScreenCaptureKit). Set
-# false to skip — AX text alone is enough for most routing decisions.
-include_screenshot = true
+# Screenshot mode:
+#   "auto"   — fire only when AX text is sparse (videos/canvas/Figma/PDF
+#              etc.) where AX alone gives no useful signal.
+#   "always" — every capture.
+#   "never"  — never.
+screenshot_mode = "auto"
+screenshot_ax_sparse_threshold = 200
 screenshot_max_width = 1280
 screenshot_jpeg_quality = 80
 ax_depth = 100

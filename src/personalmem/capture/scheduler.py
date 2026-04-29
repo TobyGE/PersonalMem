@@ -17,7 +17,7 @@ from .. import paths
 from ..config import CaptureConfig
 from ..logger import get
 from ..store import fts as fts_store
-from . import ax_capture, s1_parser, screenshot, window_meta
+from . import ax_capture, ax_pruner, s1_parser, screenshot, window_meta
 from .event_dispatcher import EventDispatcher
 from .watcher import AXWatcherProcess
 
@@ -30,6 +30,33 @@ def _now_iso() -> str:
 
 def _safe_filename(ts: str) -> str:
     return ts.replace(":", "-").replace("+", "p")
+
+
+def _should_screenshot(cfg: CaptureConfig, out: dict[str, Any]) -> bool:
+    """Decide whether to fire mac-frontcap for this capture.
+
+    "auto" mode is the cheap-but-targeted policy: skip the screenshot
+    when the AX tree already gives us plenty of text (the common case
+    — terminals, editors, web articles, chat apps), and grab one when
+    AX is essentially empty (video players, Figma, canvas-rendered
+    pages, native renderers) — the only scenarios where text alone
+    leaves the LLM blind.
+    """
+    mode = cfg.screenshot_mode
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    # "auto" — fall back to "always" if AX failed entirely (no tree at
+    # all means we have *nothing*, so a screenshot is even more valuable).
+    ax_tree = out.get("ax_tree")
+    if not isinstance(ax_tree, dict):
+        return True
+    try:
+        pruned = ax_pruner.prune_ax_tree(ax_tree)
+    except Exception:  # noqa: BLE001 — never let pruning failures kill a capture
+        return True
+    return len(pruned) < cfg.screenshot_ax_sparse_threshold
 
 
 def _build_capture(
@@ -70,7 +97,7 @@ def _build_capture(
     else:
         out["ax_unavailable"] = True
 
-    if cfg.include_screenshot:
+    if _should_screenshot(cfg, out):
         # mac-frontcap targets the frontmost window directly via
         # ScreenCaptureKit — no separate crop step or window-bounds math.
         shot = screenshot.grab(
