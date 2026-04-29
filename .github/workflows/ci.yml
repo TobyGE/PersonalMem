@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-smoke:
+    # macOS-only: Swift binaries (mac-ax-watcher / mac-ax-helper /
+    # mac-frontcap / mac-vision-ocr) plus pyobjc-framework-Quartz are
+    # all macOS-specific.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Swift binaries
+        run: |
+          bash resources/build-mac-ax-watcher.sh
+          bash resources/build-mac-ax-helper.sh
+          bash resources/build-mac-frontcap.sh
+          bash resources/build-mac-vision-ocr.sh
+
+      - name: Install package (editable)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Smoke test imports + CLI
+        run: |
+          python -c "
+          from personalmem import cli, config, paths, onboard
+          from personalmem.capture import (
+              ax_capture, ax_pruner, scheduler, screenshot, vision_ocr, watcher,
+          )
+          from personalmem.pipeline import router, summarizer
+          from personalmem.store import threads
+          print('imports ok')
+          "
+          personalmem --help
+          personalmem status
