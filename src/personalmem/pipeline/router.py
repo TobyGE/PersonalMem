@@ -16,7 +16,7 @@ from ..capture import ax_pruner, vision_ocr
 from ..config import Config
 import logging
 from ..store.threads import Thread
-from ..llm import call_llm, extract_text
+from ..llm import call_llm, extract_full_text, extract_json_text, extract_text
 
 logger = logging.getLogger("personalmem.pipeline.router")
 
@@ -34,17 +34,15 @@ class CaptureView:
     focused_value: str
     url: str
     visible_text: str
+    description: str = ""    # router-generated one-liner, populated for history captures
 
 
 @dataclass
 class RouteDecision:
-    action: str                     # 'continue' | 'new' | 'close_and_new'
+    action: str                     # 'continue' | 'new'
     thread_id: str | None           # target thread for 'continue'
-    close_thread_ids: list[str]     # threads to close (only for close_and_new)
-    new_title: str | None           # title for new thread
-    updated_title: str              # refined title for the affected thread (may upgrade existing)
-    updated_summary: str            # the running narrative the affected thread should now have
     reason: str
+    capture_description: str        # one-sentence concrete description of THIS new capture
     raw: str                        # raw LLM output for debugging
 
 
@@ -59,20 +57,25 @@ def _truncate(s: str | None, n: int) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
+# Per-thread history cap rendered into the router prompt. The full capture
+# list balloons prompts to 30K+ tokens once a thread accumulates 50+
+# captures (e.g. a long coding session). The most recent N captures carry
+# enough activity-pattern signal for routing decisions; older ones are
+# essentially redundant for "is this new capture a continuation".
+_HISTORY_PER_THREAD = 5
+
+
 def _render_thread_context(
     threads: Iterable[Thread],
     thread_captures: dict[str, list[CaptureView]],
     buffer_dir: Path | None = None,
 ) -> str:
-    """Render each open thread with the FULL list of captures already routed
-    to it. The router judges by complete activity history, not by an
-    abstract narrative — concrete activities resist over-merging on
-    surface topical overlap.
+    """Render each open thread with up to _HISTORY_PER_THREAD most recent
+    captures so the router can judge by activity pattern (concrete actions,
+    not abstract topic summaries — those over-merge on "all about AI").
 
-    No per-capture truncation: each capture's full pruned text + focused
-    user_text reaches the LLM. If the prompt exceeds the context window
-    that's a downstream problem to solve via budgeting / fewer threads
-    in top-K, not by pre-truncating signal away.
+    Older captures are summarized as a count; the title line still shows
+    how many total captures exist so the LLM knows the thread's scale.
     """
     lines: list[str] = []
     for i, t in enumerate(threads, 1):
@@ -83,22 +86,28 @@ def _render_thread_context(
         if not caps:
             lines.append("    (no captures yet)")
             continue
-        lines.append(f"    {len(caps)} captures so far:")
-        for c in caps:
-            ts_short = c.timestamp[11:19] if len(c.timestamp) > 11 else c.timestamp
-            lines.append(f"      [{ts_short}] {c.app or '?'} — {c.window_title or ''}")
-            if c.focused_value:
-                lines.append(f"        user_text: {c.focused_value!r}")
-            # History captures: just their own pruned AX + own OCR.
-            # Folded siblings (if any) were already merged in when this
-            # capture was the focal one of its phase.
-            pruned = _visible_text_for(
-                c.id, buffer_dir=buffer_dir, fallback=c.visible_text or "",
+        if len(caps) <= _HISTORY_PER_THREAD:
+            lines.append(f"    {len(caps)} captures so far:")
+            shown = caps
+        else:
+            hidden = len(caps) - _HISTORY_PER_THREAD
+            lines.append(
+                f"    {len(caps)} captures so far "
+                f"(showing last {_HISTORY_PER_THREAD}; {hidden} earlier hidden):"
             )
-            if pruned:
-                lines.append(f"        visible_text: {pruned!r}")
-            if c.url:
-                lines.append(f"        url: {c.url}")
+            shown = caps[-_HISTORY_PER_THREAD:]
+        for c in shown:
+            # History captures get rendered as a one-line activity log
+            # using the router-generated description (cached on the
+            # thread_captures row when the capture was first routed).
+            # No raw AX dump — keeps the prompt tight (~40-100 chars per
+            # capture instead of ~1.5 KB), which is the difference
+            # between a 5K and a 50K token routing prompt.
+            ts_short = c.timestamp[11:19] if len(c.timestamp) > 11 else c.timestamp
+            line = f"      [{ts_short}] {c.app or '?'} — {c.window_title or ''}"
+            if c.description:
+                line += f"\n        » {c.description}"
+            lines.append(line)
     return "\n".join(lines) if lines else "(none — no threads currently open)"
 
 
@@ -178,37 +187,33 @@ def route(
         messages=[{"role": "user", "content": rendered}],
         json_mode=True,
     )
-    raw = extract_text(response)
+    # Keep the full untouched output (incl. side-channel reasoning_content
+    # from LM Studio / DeepSeek-R1, in-band <think>...</think> from Qwen3,
+    # code fences, leading prose) for debugging in _decisions.json. The
+    # cleaned form is only used for json.loads().
+    raw_full = extract_full_text(response)
+    cleaned = extract_json_text(response)
 
     try:
-        data = json.loads(raw)
+        data = json.loads(cleaned)
     except json.JSONDecodeError:
-        logger.warning("router LLM returned non-JSON; defaulting to new thread. raw=%r", raw[:200])
+        logger.warning("router LLM returned non-JSON; defaulting to new thread. "
+                       "stripped=%r full=%r", cleaned[:200], raw_full[:300])
         return RouteDecision(
             action="new",
             thread_id=None,
-            close_thread_ids=[],
-            new_title=_default_title(capture),
-            updated_title=_default_title(capture),
-            updated_summary="",
             reason="parse_error",
-            raw=raw,
+            capture_description="",
+            raw=raw_full,
         )
 
     action = data.get("action") or "new"
-    if action not in {"continue", "new", "close_and_new"}:
+    if action not in {"continue", "new"}:
         action = "new"
 
     thread_id = data.get("thread_id")
-    close_ids = data.get("close_thread_ids") or []
-    if not isinstance(close_ids, list):
-        close_ids = []
-    new_title = data.get("new_title") or (_default_title(capture) if action != "continue" else None)
-    updated_title = (data.get("updated_title") or "").strip()[:120]
-    updated_summary = (data.get("updated_summary") or "").strip()
     reason = (data.get("reason") or "")[:300]
 
-    open_ids = [t.id for t in open_threads]
     if action == "continue":
         resolved = _resolve_thread_id(thread_id, open_threads)
         if resolved is None:
@@ -217,7 +222,6 @@ def route(
             )
             action = "new"
             thread_id = None
-            new_title = new_title or _default_title(capture)
         else:
             if resolved != thread_id:
                 logger.info(
@@ -226,20 +230,14 @@ def route(
                 )
             thread_id = resolved
 
-    close_ids = [
-        tid for tid in (_resolve_thread_id(c, open_threads) for c in close_ids)
-        if tid is not None
-    ]
+    capture_description = (data.get("capture_description") or "").strip()[:300]
 
     return RouteDecision(
         action=action,
         thread_id=thread_id if action == "continue" else None,
-        close_thread_ids=close_ids if action == "close_and_new" else [],
-        new_title=new_title if action != "continue" else None,
-        updated_title=updated_title,
-        updated_summary=updated_summary,
         reason=reason,
-        raw=raw,
+        capture_description=capture_description,
+        raw=raw_full,
     )
 
 
@@ -269,8 +267,11 @@ def _resolve_thread_id(raw, open_threads: list[Thread]) -> str | None:
         if with_prefix in open_set:
             return with_prefix
 
+    # Numeric index — model returned "3" or "thr_3" intending the [3]
+    # row in the prompt's open-threads listing.
+    idx_candidate = s[4:] if s.startswith("thr_") else s
     try:
-        idx = int(s) - 1
+        idx = int(idx_candidate) - 1
         if 0 <= idx < len(open_threads):
             return open_threads[idx].id
     except ValueError:
@@ -278,11 +279,28 @@ def _resolve_thread_id(raw, open_threads: list[Thread]) -> str | None:
 
     bare = s[4:] if s.startswith("thr_") else s
     if len(bare) >= 6:
+        # Same-length hex typos (≤ 2 char-position diffs)
         for tid in open_ids:
             tid_bare = tid[4:] if tid.startswith("thr_") else tid
             if len(tid_bare) == len(bare):
                 diffs = sum(1 for a, b in zip(tid_bare, bare) if a != b)
                 if diffs <= 2:
                     return tid
+
+        # Missing/extra char(s): the LLM dropped or duplicated a hex
+        # nibble. e.g. real "fe2efe0aba35" → emitted "2efe0aba35".
+        # Accept if the candidate is a substring of exactly one real id
+        # AND it covers ≥ 80% of that id's bare length (avoids matching
+        # arbitrarily short suffixes that could ambiguously hit several
+        # ids).
+        cands = [
+            tid for tid in open_ids
+            if (
+                bare in (tid[4:] if tid.startswith("thr_") else tid)
+                and len(bare) >= 0.8 * len(tid[4:] if tid.startswith("thr_") else tid)
+            )
+        ]
+        if len(cands) == 1:
+            return cands[0]
 
     return None

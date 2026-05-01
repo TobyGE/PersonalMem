@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS threads (
     opened_at TEXT NOT NULL,
     last_active_at TEXT NOT NULL,
     closed_at TEXT,
-    summary TEXT
+    summary TEXT,                          -- legacy alias of narrative; kept for back-compat
+    narrative TEXT,                        -- summarizer-generated running narrative
+    key_events_json TEXT,                  -- JSON array of bullet strings
+    outcome TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status, last_active_at);
@@ -33,11 +36,23 @@ CREATE TABLE IF NOT EXISTS thread_captures (
     thread_id TEXT NOT NULL,
     capture_id TEXT NOT NULL,
     joined_at TEXT NOT NULL,
+    description TEXT,                      -- one-line activity description from router
     PRIMARY KEY (thread_id, capture_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_thread_captures_capture ON thread_captures(capture_id);
 """
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """Lightweight migrations for older dbs."""
+    tc_cols = [r[1] for r in conn.execute("PRAGMA table_info(thread_captures)")]
+    if "description" not in tc_cols:
+        conn.execute("ALTER TABLE thread_captures ADD COLUMN description TEXT")
+    t_cols = [r[1] for r in conn.execute("PRAGMA table_info(threads)")]
+    for col in ("narrative", "key_events_json", "outcome"):
+        if col not in t_cols:
+            conn.execute(f"ALTER TABLE threads ADD COLUMN {col} TEXT")
 
 
 @dataclass
@@ -49,10 +64,14 @@ class Thread:
     last_active_at: str
     closed_at: str | None
     summary: str | None
+    narrative: str | None = None
+    key_events_json: str | None = None
+    outcome: str | None = None
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _ensure_columns(conn)
 
 
 def new_thread_id() -> str:
@@ -69,14 +88,26 @@ def open_thread(conn: sqlite3.Connection, *, title: str, opened_at: str) -> str:
     return tid
 
 
-def append_capture(conn: sqlite3.Connection, *, thread_id: str, capture_id: str, at: str) -> None:
+def append_capture(
+    conn: sqlite3.Connection, *,
+    thread_id: str, capture_id: str, at: str,
+    description: str | None = None,
+) -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO thread_captures(thread_id, capture_id, joined_at) "
-        "VALUES (?, ?, ?)",
-        (thread_id, capture_id, at),
+        "INSERT OR IGNORE INTO thread_captures(thread_id, capture_id, joined_at, description) "
+        "VALUES (?, ?, ?, ?)",
+        (thread_id, capture_id, at, description),
     )
+    # Reopen the thread if it was previously closed: appending a capture
+    # means the user returned to the topic, so the thread is no longer a
+    # closed historical record. The router only ever picks "continue"
+    # when it judges the new capture genuinely belongs here.
     conn.execute(
-        "UPDATE threads SET last_active_at=? WHERE id=?",
+        "UPDATE threads "
+        "   SET last_active_at = ?, "
+        "       status = 'open', "
+        "       closed_at = NULL "
+        " WHERE id = ?",
         (at, thread_id),
     )
 
@@ -98,6 +129,24 @@ def set_summary(conn: sqlite3.Connection, *, thread_id: str, summary: str) -> No
     """Overwrite a thread's running narrative. Used by the router after each
     routing decision so the next decision sees the updated topic context."""
     conn.execute("UPDATE threads SET summary=? WHERE id=?", (summary, thread_id))
+
+
+def save_full_summary(
+    conn: sqlite3.Connection, *,
+    thread_id: str, title: str, narrative: str,
+    key_events: list[str], outcome: str,
+) -> None:
+    """Cache a complete summarizer output on the thread row. Lets the
+    end-of-run .md writer skip another LLM call — incremental summarize
+    has already produced the latest summary after each routing decision.
+    """
+    import json as _json
+    conn.execute(
+        "UPDATE threads "
+        "   SET title = ?, narrative = ?, key_events_json = ?, outcome = ? "
+        " WHERE id = ?",
+        (title, narrative, _json.dumps(key_events, ensure_ascii=False), outcome, thread_id),
+    )
 
 
 def list_open_threads(
@@ -161,4 +210,15 @@ def _row_to_thread(r) -> Thread:
         last_active_at=r["last_active_at"],
         closed_at=r["closed_at"],
         summary=r["summary"],
+        narrative=_safe_col(r, "narrative"),
+        key_events_json=_safe_col(r, "key_events_json"),
+        outcome=_safe_col(r, "outcome"),
     )
+
+
+def _safe_col(r, name: str):
+    """sqlite3.Row keyed access raises if the column wasn't selected."""
+    try:
+        return r[name]
+    except (IndexError, KeyError):
+        return None

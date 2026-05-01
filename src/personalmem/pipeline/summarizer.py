@@ -15,7 +15,7 @@ from pathlib import Path
 from ..capture import ax_pruner
 from ..config import Config
 import logging
-from ..llm import call_llm, extract_text
+from ..llm import call_llm, extract_full_text, extract_json_text, extract_text
 from .router import CaptureView
 
 logger = logging.getLogger("personalmem.pipeline.summarizer")
@@ -39,11 +39,11 @@ def _load_prompt() -> str:
 def _render_captures(captures: list[CaptureView], buffer_dir: Path | None = None) -> str:
     """Render captures for the thread-summary prompt.
 
-    No length truncation. Loads AX-pruned visible_text from the
-    capture-buffer JSON (chrome buttons stripped, parent-child duplicates
-    collapsed) so the LLM sees signal-dense content. Truncating at small
-    char limits silently dropped chat-message bodies (WeChat) and verbatim
-    quotes (typed code) — never do that here.
+    Prefers the router-cached one-line ``description`` over the full
+    pruned AX dump. A 25-word description × 100 captures fits in ~4K
+    tokens, where dumping full AX bloats the prompt to 30-60K tokens
+    and breaks local models. Old captures without a description fall
+    back to the pruned AX path so the change is backward-compatible.
     """
     lines: list[str] = []
     for c in captures:
@@ -51,15 +51,21 @@ def _render_captures(captures: list[CaptureView], buffer_dir: Path | None = None
         bits = [f"[{ts}] {c.app}"]
         if c.window_title:
             bits.append(f"win={c.window_title!r}")
-        if c.focused_role:
-            bits.append(f"role={c.focused_role}")
         if c.url:
             bits.append(f"url={c.url!r}")
-        if c.focused_value:
-            bits.append(f"input={c.focused_value!r}")
-        pruned = ax_pruner.load_pruned_text(c.id, buffer_dir=buffer_dir, fallback=c.visible_text or "")
-        if pruned:
-            bits.append(f"text={pruned!r}")
+        if c.description:
+            bits.append(f"activity={c.description!r}")
+        else:
+            # Fallback for captures routed before description was cached.
+            if c.focused_role:
+                bits.append(f"role={c.focused_role}")
+            if c.focused_value:
+                bits.append(f"input={c.focused_value!r}")
+            pruned = ax_pruner.load_pruned_text(
+                c.id, buffer_dir=buffer_dir, fallback=c.visible_text or ""
+            )
+            if pruned:
+                bits.append(f"text={pruned!r}")
         lines.append(" | ".join(bits))
     return "\n".join(lines)
 
@@ -90,12 +96,14 @@ def summarize(
         messages=[{"role": "user", "content": rendered}],
         json_mode=True,
     )
-    raw = extract_text(response)
+    raw = extract_json_text(response)
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("summarizer returned non-JSON; using fallback. raw=%r", raw[:200])
+        full = extract_full_text(response)
+        logger.warning("summarizer returned non-JSON; using fallback. "
+                       "stripped=%r full=%r", raw[:200], full[:300])
         return ThreadSummary(
             title=title,
             narrative="(LLM output failed to parse; fallback summary unavailable)",

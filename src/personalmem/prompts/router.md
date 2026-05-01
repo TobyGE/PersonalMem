@@ -31,35 +31,22 @@ visible_text:  {visible_text}
 ## Decision options
 
 - `continue` (with `thread_id`): the capture belongs to an already-open thread.
-- `new`: the capture starts a new topic, with a short action-oriented `new_title`.
-- `close_and_new`: rare. Only when an open thread has clearly concluded AND the new capture starts an unrelated topic.
-
-## Refining the title
-
-Each routing decision can also refine the affected thread's title via `updated_title`. The initial title (set when the thread first opened) was generated from a single capture and is often shallow ("iTerm2", "Google Chrome"). As more captures accumulate and the thread's actual topic crystallizes, you can replace it with a content-derived title.
-
-- For `continue`: feel free to upgrade the title if the recent capture history reveals a higher-level topic (e.g. "iTerm2" → "Debugging OpenChronicle AX tree handling"). Keep current title if no upgrade is warranted.
-- For `new`: this is the new thread's title (same content as `new_title`).
-- Keep titles short (≤8 words), action-oriented.
-- **DO NOT rewrite the title when the new capture has no clear content** — a single low-information capture (blank window, unparseable AX, generic app menu) must not erase a title earned from prior substantive captures. In that case, repeat the existing title verbatim.
+- `new`: the capture starts a new topic.
 
 ## Anti-noise
 
 - UI chrome (browser address bar, extension icons, app sidebars) is not signal.
 - If the capture has *no clear content* (e.g. a blank menu, unparseable visible_text, "Content not observed via accessibility" sentinel):
   - Prefer `continue` of an open thread **whose recent activity is in the SAME APP** as this capture.
-  - If no open thread matches the app, prefer `new` with a generic title (e.g. "Brief WeChat check") — DO NOT continue an unrelated thread just because it's the most recent.
-  - **DO NOT update the title** based on this capture (per the rule above). The empty capture has nothing reliable to say about what the thread is about.
+  - If no open thread matches the app, prefer `new` — DO NOT continue an unrelated thread just because it's the most recent.
 
 ## Output
 
 Return a JSON object with exactly these fields:
 
-- `action`: one of `"continue"`, `"new"`, `"close_and_new"`
-- `thread_id`: id of the thread to continue (required if action=continue), or `null`
-- `close_thread_ids`: array of thread ids to close (required if action=close_and_new; empty array otherwise)
-- `new_title`: short (≤8 words) action-oriented title for the new thread (required if action=new or close_and_new), or `null`
-- `updated_title`: short (≤8 words) refined title for the affected thread; replaces existing title if you've thought of a better one, or repeats it if no change
+- `action`: one of `"continue"`, `"new"`
+- `thread_id`: id of the thread to continue (required if action=continue), or `null` for `new`
 - `reason`: one short sentence explaining your judgment, referencing the specific *activities* you compared
+- `capture_description`: ONE concrete sentence (≤25 words) describing what the user is doing in **this new capture** specifically. Name the app + the topic/artifact + the action. This sentence is what future routing decisions will see as the "activity log" for this capture, so be specific about identifiable signals (paper title, repo name, chat partner, URL, file path, video title) — NOT topic-level abstractions like "AI research" or "WeChat chat".
 
-Output only the JSON object, no markdown fences, no surrounding prose.
+Output only the JSON object, no markdown fences, no surrounding prose. Thread titles are managed by the summarizer separately — do not output a title.

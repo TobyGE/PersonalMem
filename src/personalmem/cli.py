@@ -28,7 +28,7 @@ from pathlib import Path
 
 from . import config as oc_config
 from . import paths
-from .capture import ax_pruner
+from .capture import ax_pruner, vision_ocr
 from .pipeline import router as thread_router
 from .pipeline import summarizer as thread_summarizer
 from .pipeline.router import CaptureView
@@ -189,7 +189,8 @@ def run_routing(
         open_threads = thread_store.list_recent_threads(out_conn, top_k=top_k)
 
         # Pull each open thread's full capture history so the router judges
-        # by activity pattern, not by abstract narrative.
+        # by activity pattern (rendered as one-line descriptions cached
+        # from past routing decisions).
         thread_captures: dict[str, list[CaptureView]] = {}
         for t in open_threads:
             cap_ids = thread_store.thread_capture_ids(out_conn, t.id)
@@ -204,9 +205,22 @@ def run_routing(
                 " ORDER BY timestamp ASC",
                 cap_ids,
             ).fetchall()
-            thread_captures[t.id] = [
-                row_to_view(r, sub_context_for.get(r["id"], "")) for r in t_cap_rows
-            ]
+            # Per-capture description (cached from when this capture was
+            # first routed). Missing for captures from older runs.
+            desc_for: dict[str, str] = {
+                r["capture_id"]: (r["description"] or "")
+                for r in out_conn.execute(
+                    f"SELECT capture_id, description FROM thread_captures "
+                    f"WHERE thread_id = ? AND capture_id IN ({placeholders})",
+                    (t.id, *cap_ids),
+                )
+            }
+            views: list[CaptureView] = []
+            for r in t_cap_rows:
+                v = row_to_view(r, sub_context_for.get(r["id"], ""))
+                v.description = desc_for.get(r["id"], "")
+                views.append(v)
+            thread_captures[t.id] = views
 
         if not open_threads:
             tid = thread_store.open_thread(
@@ -234,40 +248,93 @@ def run_routing(
                   file=sys.stderr)
             decision = thread_router.RouteDecision(
                 action="continue", thread_id=open_threads[0].id,
-                close_thread_ids=[], new_title=None,
-                updated_title="", updated_summary="",
-                reason=f"router_exception: {e}", raw="",
+                reason=f"router_exception: {e}",
+                capture_description="",
+                raw="",
             )
-
-        for close_id in decision.close_thread_ids:
-            thread_store.close_thread(out_conn, thread_id=close_id, closed_at=cap.timestamp)
 
         if decision.action == "continue" and decision.thread_id:
             target = decision.thread_id
         else:
+            # New thread: use the LLM's capture_description (truncated) as
+            # a placeholder title — summarizer will overwrite with a proper
+            # one when the thread is summarized.
+            placeholder_title = (
+                decision.capture_description.split(".")[0][:80]
+                if decision.capture_description
+                else (cap.app or "Untitled")
+            )
             target = thread_store.open_thread(
                 out_conn,
-                title=decision.new_title or (cap.app or "Untitled"),
+                title=placeholder_title,
                 opened_at=cap.timestamp,
             )
 
         thread_store.append_capture(
             out_conn, thread_id=target, capture_id=cap.id, at=cap.timestamp,
+            description=decision.capture_description or None,
         )
 
-        if decision.updated_title:
-            thread_store.update_title(
-                out_conn, thread_id=target, title=decision.updated_title,
-            )
+        # Incremental thread summary after each routing decision: gives
+        # the next router call a proper title (and eventually narrative /
+        # key_events) instead of the placeholder. Cheap because each
+        # summarize prompt is bounded to one thread's description-line
+        # history (~150 chars × N captures).
+        try:
+            target_thread = thread_store.get_thread(out_conn, target)
+            if target_thread is not None:
+                t_cap_ids = thread_store.thread_capture_ids(out_conn, target)
+                ph = ",".join("?" * len(t_cap_ids))
+                t_cap_rows = in_conn.execute(
+                    "SELECT id, timestamp, app_name, window_title, focused_role, "
+                    "       focused_value, visible_text, url "
+                    f"  FROM captures WHERE id IN ({ph}) "
+                    " ORDER BY timestamp ASC",
+                    t_cap_ids,
+                ).fetchall()
+                t_desc_for = {
+                    r["capture_id"]: (r["description"] or "")
+                    for r in out_conn.execute(
+                        f"SELECT capture_id, description FROM thread_captures "
+                        f"WHERE thread_id = ? AND capture_id IN ({ph})",
+                        (target, *t_cap_ids),
+                    )
+                }
+                t_views = []
+                for r in t_cap_rows:
+                    v = row_to_view(r, sub_context_for.get(r["id"], ""))
+                    v.description = t_desc_for.get(r["id"], "")
+                    t_views.append(v)
+                summary = thread_summarizer.summarize(
+                    cfg, thread_id=target, title=target_thread.title,
+                    opened_at=target_thread.opened_at,
+                    closed_at=target_thread.last_active_at,
+                    captures=t_views, buffer_dir=buffer_dir,
+                )
+                # Cache the full summary on the thread row. End-of-run
+                # .md writer reads these fields directly — no second
+                # LLM pass needed.
+                thread_store.save_full_summary(
+                    out_conn, thread_id=target,
+                    title=(summary.title or target_thread.title),
+                    narrative=summary.narrative,
+                    key_events=summary.key_events,
+                    outcome=summary.outcome,
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! incremental summarize error: {e}", file=sys.stderr)
 
         routed[decision.action] = routed.get(decision.action, 0) + 1
         decisions.append({
             "i": i, "ts": cap.timestamp, "app": cap.app,
             "title_hint": cap.window_title[:60],
             "action": decision.action, "thread_id": target,
-            "close_ids": decision.close_thread_ids,
-            "updated_title": decision.updated_title,
             "reason": decision.reason,
+            "capture_description": decision.capture_description,
+            # Full LLM output incl. <think>...</think> reasoning trace —
+            # invaluable for debugging why a local model picked a
+            # different thread from Haiku.
+            "raw": decision.raw,
         })
 
         if (i + 1) % 10 == 0:
@@ -292,14 +359,22 @@ def close_remaining(out_conn: sqlite3.Connection, *, closed_at: str) -> int:
     return len(threads)
 
 
-def summarize_all(
-    cfg, *, in_conn, out_conn, out_dir: Path, buffer_dir: Path,
+def write_thread_mds(
+    *, in_conn, out_conn, out_dir: Path, buffer_dir: Path,
 ) -> dict:
+    """Write one Markdown file per thread using the cached per-thread
+    summary that was populated incrementally during routing. No LLM call
+    here — all generation already happened. Threads with no cached
+    narrative (e.g. routed before this code, or summarize errored) get
+    title-only output.
+    """
+    import json as _json
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[dict] = []
     rows = out_conn.execute(
-        "SELECT id, title, opened_at, closed_at, last_active_at FROM threads "
-        "ORDER BY opened_at ASC"
+        "SELECT id, title, opened_at, closed_at, last_active_at, "
+        "       narrative, key_events_json, outcome "
+        "  FROM threads ORDER BY opened_at ASC"
     ).fetchall()
     for r in rows:
         tid = r["id"]
@@ -316,40 +391,35 @@ def summarize_all(
         ).fetchall()
         captures = [row_to_view(cr) for cr in cap_rows]
 
-        narrative = ""
-        title = r["title"]
-        outcome = ""
-        key_events: list[str] = []
         try:
-            summary = thread_summarizer.summarize(
-                cfg, thread_id=tid, title=r["title"],
-                opened_at=r["opened_at"],
-                closed_at=r["closed_at"] or r["last_active_at"],
-                captures=captures,
-                buffer_dir=buffer_dir,
-            )
-            title = summary.title or r["title"]
-            narrative = summary.narrative
-            outcome = summary.outcome
-            key_events = summary.key_events
-        except Exception as e:  # noqa: BLE001
-            print(f"  ! summarizer error for {tid}: {e}", file=sys.stderr)
+            key_events = _json.loads(r["key_events_json"] or "[]")
+            if not isinstance(key_events, list):
+                key_events = []
+        except (TypeError, ValueError):
+            key_events = []
 
         md = _render_thread_md(
-            tid=tid, title=title,
+            tid=tid, title=r["title"],
             opened_at=r["opened_at"],
             closed_at=r["closed_at"] or r["last_active_at"],
-            narrative=narrative, outcome=outcome,
-            key_events=key_events, captures=captures,
+            narrative=r["narrative"] or "",
+            outcome=r["outcome"] or "",
+            key_events=key_events,
+            captures=captures,
             buffer_dir=buffer_dir,
         )
         (out_dir / f"{tid}.md").write_text(md)
         written.append({
-            "thread_id": tid, "title": title,
+            "thread_id": tid, "title": r["title"],
             "captures": len(captures),
-            "outcome": outcome,
+            "outcome": r["outcome"] or "",
         })
     return {"threads_written": len(written), "details": written}
+
+
+# Back-compat alias: anything still calling summarize_all gets the no-LLM
+# version. Existing call sites in cmd_run continue to work.
+summarize_all = write_thread_mds
 
 
 def _safe_codeblock(text: str) -> str:
@@ -452,6 +522,36 @@ def cmd_run(args) -> int:
     )
     print(f"coalesce: {raw_count} → {len(kept)} ({raw_count - len(kept)} folded)",
           file=sys.stderr)
+
+    # Drop signal-less captures: AX has ZERO content bullets AND no
+    # focused user_text AND no URL AND no OCR. Pruned AX always has
+    # `## App / _bundle_ / ### window` header lines (~50-70 chars
+    # before any content), so length alone is misleading — count
+    # actual bullet lines (lines starting with "-"). Without any
+    # signal source, the router is just guessing among visible
+    # threads (e.g. a WeChat window-switch click with no chat
+    # selected) and pollutes whichever thread it lands on.
+    pre_filter = len(kept)
+    filtered_kept: list[sqlite3.Row] = []
+    filtered_folded: list[list[str]] = []
+    for i, r in enumerate(kept):
+        pruned = ax_pruner.load_pruned_text(r["id"], buffer_dir=buffer_dir, fallback="")
+        bullets = sum(1 for line in pruned.splitlines()
+                      if line.lstrip().startswith("-"))
+        ocr = vision_ocr.load_ocr_text(r["id"], buffer_dir=buffer_dir)
+        if (
+            bullets == 0
+            and not (r["focused_value"] or "").strip()
+            and not (r["url"] or "").strip()
+            and not ocr.strip()
+        ):
+            continue
+        filtered_kept.append(r)
+        filtered_folded.append(folded[i])
+    kept, folded = filtered_kept, filtered_folded
+    print(f"signal filter: {pre_filter} → {len(kept)} "
+          f"({pre_filter - len(kept)} signal-less captures dropped)",
+          file=sys.stderr)
     rows = kept
     # Map kept_capture_id → list of folded capture IDs that collapsed
     # into it. Used by the router to merge OCR text across the whole
@@ -477,10 +577,10 @@ def cmd_run(args) -> int:
     closed_n = close_remaining(out_conn, closed_at=last_ts)
     routing_stats["forced_close_at_end"] = closed_n
 
-    print("summarizing closed threads...", file=sys.stderr)
+    print("writing thread .md files (cached summaries — no LLM call)...", file=sys.stderr)
     t2 = time.monotonic()
-    summary_stats = summarize_all(
-        cfg, in_conn=in_conn, out_conn=out_conn,
+    summary_stats = write_thread_mds(
+        in_conn=in_conn, out_conn=out_conn,
         out_dir=out_dir, buffer_dir=buffer_dir,
     )
     summary_stats["summary_seconds"] = round(time.monotonic() - t2, 1)
@@ -503,6 +603,20 @@ def cmd_run(args) -> int:
     print(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"\nwrote {summary_stats['threads_written']} thread files to {out_dir}",
           file=sys.stderr)
+
+    # Mirror to Obsidian vault if configured. Pure overlay copy: existing
+    # files in the destination are overwritten, but nothing is deleted —
+    # safe to point at a folder that has other notes alongside.
+    mirror = (cfg.storage.vault_mirror_dir or "").strip()
+    if mirror:
+        import shutil
+        mirror_path = Path(mirror).expanduser()
+        mirror_path.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for src in list(out_dir.glob("*.md")) + list(out_dir.glob("_*.json")):
+            shutil.copy2(src, mirror_path / src.name)
+            copied += 1
+        print(f"mirrored {copied} files → {mirror_path}", file=sys.stderr)
     return 0
 
 

@@ -68,7 +68,13 @@ class CoalesceConfig:
 
 @dataclass
 class RouterConfig:
-    top_k: int = 10                  # top-K open threads shown to router
+    # Top-K most-recently-active threads (open + closed) shown to the
+    # router. Set high (100) so a months-old thread can still be
+    # resumed when its topic returns. WARNING: each visible thread
+    # also drags in its full capture history — once thread count grows
+    # past ~30, the prompt size becomes the bottleneck and we should
+    # add per-thread history truncation rather than dropping top_k.
+    top_k: int = 100
 
 
 @dataclass
@@ -83,6 +89,12 @@ class StorageConfig:
     """Where PersonalMem writes its own state."""
     threads_db: str = "~/.personalmem/threads.db"
     out_dir: str = "~/.personalmem/threads"
+    # Optional mirror: after each `personalmem run`, copy all .md + the
+    # _decisions.json / _report.json sidecars into this directory
+    # (typically a folder inside an Obsidian vault). Empty = no mirror.
+    # Files are overwritten on every run; nothing in this directory
+    # gets deleted, so it's safe to keep other notes alongside.
+    vault_mirror_dir: str = ""
 
 
 @dataclass
@@ -230,4 +242,7 @@ capture_buffer_dir = "~/.personalmem/capture-buffer"
 [storage]
 threads_db = "~/.personalmem/threads.db"
 out_dir = "~/.personalmem/threads"
+# Optional: mirror generated .md to a folder inside an Obsidian vault
+# after each `personalmem run`. Empty string disables the mirror.
+vault_mirror_dir = ""
 """
