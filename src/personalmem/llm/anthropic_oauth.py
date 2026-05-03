@@ -91,7 +91,9 @@ def _get_access_token(provider: str = "claude") -> str:
     access = tok.get("access_token")
     refresh = tok.get("refresh_token")
     if not access:
-        raise RuntimeError(f"No access_token in {_TOKEN_FILE} for provider={provider}")
+        raise RuntimeError(
+            f"No access_token in {_token_file()} for provider={provider}"
+        )
 
     if _is_expired(tok) and refresh:
         refreshed = _refresh(refresh)

@@ -173,9 +173,19 @@ def _build_capture(
 
 
 def _write_capture(out: dict[str, Any]) -> Path:
-    """Persist a built capture dict to the buffer, index it for search, and log."""
+    """Persist a built capture dict to the buffer, index it for search, and log.
+
+    Filenames are derived from the second-precision timestamp. Two events
+    in the same second would otherwise collide (later overwrites earlier);
+    suffix with ``-N`` to keep both.
+    """
     ts = out["timestamp"]
-    path = paths.capture_buffer_dir() / f"{_safe_filename(ts)}.json"
+    base = paths.capture_buffer_dir() / f"{_safe_filename(ts)}.json"
+    path = base
+    n = 1
+    while path.exists():
+        path = base.with_name(f"{base.stem}-{n}.json")
+        n += 1
     path.write_text(json.dumps(out, ensure_ascii=False))
     _index_capture(path.stem, out)
     meta = out.get("window_meta") or {}

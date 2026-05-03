@@ -114,10 +114,42 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    _migrate_columns(conn)
     # Threads schema lives alongside captures; PersonalMem uses one DB.
     from . import threads as thread_store
     thread_store.ensure_schema(conn)
     return conn
+
+
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    """Additive column migrations for older local index.dbs.
+
+    `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so any
+    columns added since first install need explicit ALTERs. New columns
+    must always be appended (no rewrites) and tolerate NULL values in
+    rows written by older code.
+    """
+    expected = {
+        "files": [
+            ("needs_compact", "INTEGER DEFAULT 0"),
+        ],
+        "captures": [
+            ("bundle_id", "TEXT"),
+            ("focused_role", "TEXT"),
+            ("focused_value", "TEXT"),
+            ("visible_text", "TEXT"),
+            ("url", "TEXT"),
+        ],
+    }
+    for table, cols in expected.items():
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            # Table doesn't exist yet (executescript above will create it
+            # on next call) — nothing to migrate.
+            continue
+        for name, decl in cols:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 @contextmanager

@@ -523,6 +523,26 @@ def cmd_run(args) -> int:
     print(f"coalesce: {raw_count} → {len(kept)} ({raw_count - len(kept)} folded)",
           file=sys.stderr)
 
+    # Skip captures that were already routed (resume-friendly: lets
+    # `personalmem run` re-run on the same window without paying for
+    # already-finished work and without risk of routing the same
+    # capture into a different thread on second pass).
+    out_conn_ro = sqlite3.connect(f"file:{out_path}?mode=ro", uri=True)
+    already_routed = {
+        r[0] for r in out_conn_ro.execute("SELECT capture_id FROM thread_captures")
+    }
+    out_conn_ro.close()
+    if already_routed:
+        pre_resume = len(kept)
+        zipped = [(r, folded[i]) for i, r in enumerate(kept) if r["id"] not in already_routed]
+        kept = [z[0] for z in zipped]
+        folded = [z[1] for z in zipped]
+        print(f"resume: skipped {pre_resume - len(kept)} already-routed captures",
+              file=sys.stderr)
+        if not kept:
+            print("nothing new to route", file=sys.stderr)
+            return 0
+
     # Drop signal-less captures: AX has ZERO content bullets AND no
     # focused user_text AND no URL AND no OCR. Pruned AX always has
     # `## App / _bundle_ / ### window` header lines (~50-70 chars
