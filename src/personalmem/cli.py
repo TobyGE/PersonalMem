@@ -1,8 +1,10 @@
 """PersonalMem CLI.
 
 Subcommands:
+    setup                                 # guided one-time onboarding (5 checks)
+    doctor                                # read-only diagnostic
+    auth status / login / logout          # show / refresh / wipe LLM tokens
     init                                  # write default config
-    onboard                                # (re)pick LLM provider
     start                                  # start the capture daemon (background)
     stop                                   # stop the capture daemon
     status                                 # show daemon + capture status
@@ -679,18 +681,21 @@ def cmd_start(args) -> int:
         cfg_path.write_text(oc_config.DEFAULT_CONFIG_TEMPLATE)
         print(f"first run: wrote default config → {cfg_path}", file=sys.stderr)
 
-    # First-run onboarding (interactive only — no-ops in non-TTY shells).
+    # First-run setup (interactive only — no-ops in non-TTY shells).
     from . import onboard
-    if onboard.needs_onboarding():
+    if onboard.needs_onboarding() and sys.stdin.isatty():
+        from . import setup_wizard
+        print("\nFirst run detected — launching `personalmem setup` "
+              "(skip with Ctrl+C to start daemon with default config).\n",
+              file=sys.stderr)
         try:
-            onboard.run_onboarding()
+            rc = setup_wizard.run_setup()
         except (KeyboardInterrupt, EOFError):
-            print("\nonboarding cancelled — run `personalmem onboard` to retry",
+            print("\nsetup cancelled — run `personalmem setup` to retry",
                   file=sys.stderr)
             return 1
-        except Exception as e:  # noqa: BLE001
-            print(f"onboarding failed: {e}", file=sys.stderr)
-            return 1
+        if rc != 0:
+            return rc
 
     cfg = oc_config.load(cfg_path)
     pid = _read_pid()
@@ -731,13 +736,58 @@ def cmd_stop(args) -> int:
     return 0
 
 
-def cmd_onboard(args) -> int:
-    from . import onboard
-    ran = onboard.run_onboarding(force=True)
-    if not ran:
-        print("onboarding skipped (non-interactive shell)", file=sys.stderr)
-        return 1
+def cmd_setup(args) -> int:
+    from . import setup_wizard
+    return setup_wizard.run_setup()
+
+
+def cmd_doctor(args) -> int:
+    from . import setup_wizard
+    return setup_wizard.run_doctor()
+
+
+def cmd_auth_status(args) -> int:
+    from . import auth as auth_mod
+    print(auth_mod.codex_token_status().summary())
+    print(auth_mod.anthropic_token_status().summary())
+    cli_path = auth_mod.codex_cli_path()
+    print(f"codex CLI: {cli_path or 'NOT INSTALLED'}")
     return 0
+
+
+def cmd_auth_login(args) -> int:
+    """Refresh/login to a provider. Currently only Codex (Anthropic OAuth
+    happens via the onboard picker since it does PKCE inline)."""
+    from . import auth as auth_mod
+    provider = (args.provider or "codex").lower()
+    if provider == "codex":
+        return auth_mod.run_codex_login()
+    if provider in ("anthropic", "anthropic-oauth", "claude"):
+        from . import onboard
+        try:
+            onboard._onboard_anthropic_oauth()
+        except Exception as e:  # noqa: BLE001
+            print(f"anthropic login failed: {e}", file=sys.stderr)
+            return 1
+        return 0
+    print(f"unknown provider: {provider}", file=sys.stderr)
+    return 2
+
+
+def cmd_auth_logout(args) -> int:
+    from . import auth as auth_mod
+    provider = (args.provider or "codex").lower()
+    if provider == "codex":
+        return auth_mod.run_codex_logout()
+    if provider in ("anthropic", "anthropic-oauth", "claude"):
+        if auth_mod.ANTHROPIC_TOKEN_FILE.exists():
+            auth_mod.ANTHROPIC_TOKEN_FILE.unlink()
+            print(f"removed {auth_mod.ANTHROPIC_TOKEN_FILE}")
+        else:
+            print("no Anthropic OAuth tokens to remove")
+        return 0
+    print(f"unknown provider: {provider}", file=sys.stderr)
+    return 2
 
 
 def cmd_status(args) -> int:
@@ -798,8 +848,27 @@ def main() -> int:
     sp_status = sub.add_parser("status", help="show daemon + data status")
     sp_status.set_defaults(func=cmd_status)
 
-    sp_onb = sub.add_parser("onboard", help="(re)pick LLM provider")
-    sp_onb.set_defaults(func=cmd_onboard)
+    sp_setup = sub.add_parser("setup", help="guided one-time onboarding (5 checks)")
+    sp_setup.set_defaults(func=cmd_setup)
+
+    sp_doc = sub.add_parser("doctor", help="read-only diagnostic report")
+    sp_doc.set_defaults(func=cmd_doctor)
+
+    sp_auth = sub.add_parser("auth", help="manage LLM provider auth")
+    sub_auth = sp_auth.add_subparsers(dest="auth_cmd", metavar="{status,login,logout}")
+    sub_auth.required = True
+    sub_auth.add_parser("status", help="show login state for both providers"
+                        ).set_defaults(func=cmd_auth_status)
+    sp_login = sub_auth.add_parser("login", help="log in to a provider")
+    sp_login.add_argument("provider", nargs="?", default="codex",
+                          choices=["codex", "anthropic"],
+                          help="default: codex")
+    sp_login.set_defaults(func=cmd_auth_login)
+    sp_logout = sub_auth.add_parser("logout", help="wipe local tokens")
+    sp_logout.add_argument("provider", nargs="?", default="codex",
+                           choices=["codex", "anthropic"],
+                           help="default: codex")
+    sp_logout.set_defaults(func=cmd_auth_logout)
 
     args = ap.parse_args()
     return args.func(args)

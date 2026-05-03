@@ -34,10 +34,7 @@ def call_llm(
     model_cfg = cfg.model_for(stage)
 
     # Auto-detect Anthropic OAuth: if the model is Claude-family AND no
-    # api_key is configured, try the local subscription-auth helper. The
-    # helper module is gitignored — present only on machines where the
-    # user has wired up GuardClaw / Claude.com OAuth — so a graceful
-    # ImportError falls through to the standard litellm path.
+    # api_key is configured, try the local subscription-auth helper.
     if (
         "claude-" in model_cfg.model.lower()
         and not resolve_api_key(model_cfg)
@@ -53,6 +50,23 @@ def call_llm(
                 messages=messages,
                 max_tokens=model_cfg.max_tokens or 4096,
             )
+
+    # Auto-detect Codex OAuth: if the model is a ChatGPT-Codex-only one
+    # (gpt-5.5 / gpt-5.3-codex) AND no api_key is configured, route via
+    # the chatgpt.com Responses endpoint using the user's Codex CLI
+    # tokens (read from ~/.codex/auth.json by codex_oauth).
+    is_codex_model = (
+        "gpt-5.5" in model_cfg.model.lower()
+        or "gpt-5.3-codex" in model_cfg.model.lower()
+    )
+    if is_codex_model and not resolve_api_key(model_cfg):
+        from . import codex_oauth
+        model_name = model_cfg.model.split("/", 1)[-1]
+        return codex_oauth.call_codex_oauth(
+            model=model_name,
+            messages=messages,
+            max_tokens=model_cfg.max_tokens or 4096,
+        )
 
     import litellm  # lazy
     kwargs: dict[str, Any] = {

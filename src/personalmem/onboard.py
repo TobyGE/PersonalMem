@@ -132,30 +132,33 @@ def run_onboarding(*, force: bool = False) -> bool:
     print()
     print("  [1] Ollama          local, free, runs on your machine")
     print("  [2] Anthropic OAuth Claude.com Pro/Max subscription (PKCE)")
-    print("  [3] Anthropic       API key  (sk-ant-...)")
-    print("  [4] OpenAI          API key  (sk-...)")
-    print("  [5] Google Gemini   API key  (AIza...)")
-    print("  [6] OpenRouter      API key  (sk-or-...)")
-    print("  [7] Kimi / Moonshot API key  (sk-...)")
+    print("  [3] Codex OAuth     ChatGPT Plus/Pro subscription (via codex CLI)")
+    print("  [4] Anthropic       API key  (sk-ant-...)")
+    print("  [5] OpenAI          API key  (sk-...)")
+    print("  [6] Google Gemini   API key  (AIza...)")
+    print("  [7] OpenRouter      API key  (sk-or-...)")
+    print("  [8] Kimi / Moonshot API key  (sk-...)")
     print()
 
     api_key_choices = {
-        "3": "anthropic",
-        "4": "openai",
-        "5": "gemini",
-        "6": "openrouter",
-        "7": "kimi",
+        "4": "anthropic",
+        "5": "openai",
+        "6": "gemini",
+        "7": "openrouter",
+        "8": "kimi",
     }
     while True:
-        choice = (input("Choice [1-7, default 1]: ").strip() or "1")
-        if choice in {"1", "2"} or choice in api_key_choices:
+        choice = (input("Choice [1-8, default 1]: ").strip() or "1")
+        if choice in {"1", "2", "3"} or choice in api_key_choices:
             break
-        print("  please enter 1-7")
+        print("  please enter 1-8")
 
     if choice == "1":
         block = _onboard_ollama()
     elif choice == "2":
         block = _onboard_anthropic_oauth()
+    elif choice == "3":
+        block = _onboard_codex_oauth()
     else:
         block = _onboard_api_key(api_key_choices[choice])
 
@@ -247,6 +250,54 @@ def _onboard_api_key(provider_id: str) -> dict[str, Any]:
     }
     block.update(p["extra"])
     return block
+
+
+# ─── Provider: Codex OAuth (ChatGPT Plus/Pro via codex CLI) ─────────────────
+
+
+def _onboard_codex_oauth() -> dict[str, Any]:
+    """Use Codex CLI's stored OAuth tokens to talk to chatgpt.com.
+
+    No PKCE flow on our side — we delegate ``codex login`` to the
+    official binary, which handles the browser dance and writes
+    ``~/.codex/auth.json``. PersonalMem then reads that file at LLM
+    call time (via ``llm/codex_oauth.py``).
+    """
+    from . import auth as auth_mod
+
+    print()
+    print("[Codex OAuth — ChatGPT Plus/Pro subscription via codex CLI]")
+    print()
+
+    # Codex CLI must be installed
+    if auth_mod.codex_cli_path() is None:
+        print("  Codex CLI not found on PATH. Install with:")
+        print("    npm install -g @openai/codex")
+        print()
+        print("  After installation, re-run `personalmem onboard` and pick this option.")
+        raise RuntimeError("codex CLI not installed")
+
+    # Already logged in?
+    st = auth_mod.codex_token_status()
+    if st.has_file and not st.expired and not st.error:
+        print(f"  ✓ already logged in: {st.summary()}")
+    else:
+        if st.expired:
+            print("  ⚠ token expired; running `codex login`...")
+        else:
+            print("  Running `codex login` (browser flow)...")
+        rc = auth_mod.run_codex_login()
+        if rc != 0:
+            raise RuntimeError(f"codex login exited {rc}")
+        st = auth_mod.codex_token_status()
+        if not st.has_file or st.expired:
+            raise RuntimeError("codex login completed but token still missing/expired")
+        print(f"  ✓ logged in: {st.summary()}")
+
+    return {
+        "model": "gpt-5.5",   # the only Codex-account-allowed model family
+        "max_tokens": 4096,
+    }
 
 
 # ─── Provider: Anthropic OAuth ───────────────────────────────────────────────
