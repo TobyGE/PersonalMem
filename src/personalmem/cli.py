@@ -780,9 +780,17 @@ def cmd_auth_logout(args) -> int:
     if provider == "codex":
         return auth_mod.run_codex_logout()
     if provider in ("anthropic", "anthropic-oauth", "claude"):
-        if auth_mod.ANTHROPIC_TOKEN_FILE.exists():
-            auth_mod.ANTHROPIC_TOKEN_FILE.unlink()
-            print(f"removed {auth_mod.ANTHROPIC_TOKEN_FILE}")
+        # Remove BOTH the primary file and the GuardClaw fallback —
+        # otherwise auth_status would still report logged-in (and
+        # routing calls would still succeed) after a logout.
+        removed: list[str] = []
+        for p in (auth_mod.ANTHROPIC_TOKEN_FILE, auth_mod.ANTHROPIC_TOKEN_FALLBACK):
+            if p.exists():
+                p.unlink()
+                removed.append(str(p))
+        if removed:
+            for p in removed:
+                print(f"removed {p}")
         else:
             print("no Anthropic OAuth tokens to remove")
         return 0
@@ -850,6 +858,11 @@ def main() -> int:
 
     sp_setup = sub.add_parser("setup", help="guided one-time onboarding (5 checks)")
     sp_setup.set_defaults(func=cmd_setup)
+
+    # Backward-compat: pre-existing docs / muscle-memory still say
+    # `personalmem onboard`. Route it to the same wizard.
+    sp_onb = sub.add_parser("onboard", help="alias for `setup`")
+    sp_onb.set_defaults(func=cmd_setup)
 
     sp_doc = sub.add_parser("doctor", help="read-only diagnostic report")
     sp_doc.set_defaults(func=cmd_doctor)

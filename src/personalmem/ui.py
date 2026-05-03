@@ -54,9 +54,20 @@ def info(msg: str) -> None:
 
 
 def ask(prompt: str) -> bool:
-    """Return True if the user pressed Enter or 'y' / 'yes'."""
+    """Default-Yes y/n prompt. Empty input → True. Use for `[Y/n]`-style
+    questions where Enter should accept."""
     try:
         ans = input(f"  {c('?', _MAG)} {prompt} ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
     return ans in ("", "y", "yes")
+
+
+def ask_no(prompt: str) -> bool:
+    """Default-No y/n prompt. Empty input → False. Use for `[y/N]`-style
+    questions where Enter should reject."""
+    try:
+        ans = input(f"  {c('?', _MAG)} {prompt} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return ans in ("y", "yes")

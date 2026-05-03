@@ -12,7 +12,9 @@ git config core.hooksPath .githooks   # opt in to advisory pre-push codex review
 personalmem start          # foreground (-f) the first time to grant Screen Recording perm
 ```
 
-`personalmem start` walks the user through picking an LLM (Ollama / LM Studio / Anthropic OAuth / API key for Anthropic / OpenAI / Gemini / OpenRouter / Kimi). Re-run picker with `personalmem onboard`.
+First run launches `personalmem setup` — a 5-step wizard that checks Swift binaries, AX permission, Screen Recording permission, picks an LLM provider (Ollama / Anthropic OAuth / Codex OAuth / API key for Anthropic / OpenAI / Gemini / OpenRouter / Kimi), and smoke-tests the model. Re-run anytime with `personalmem setup` (or the legacy alias `personalmem onboard`).
+
+Read-only diagnostic when something starts misbehaving: `personalmem doctor`. Inspect / refresh tokens: `personalmem auth status / login [provider] / logout [provider]`.
 
 After ~30 min of normal use:
 ```bash

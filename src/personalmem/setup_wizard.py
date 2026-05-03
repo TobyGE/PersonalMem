@@ -200,7 +200,7 @@ def check_llm_configured() -> bool:
 
     if has_provider and flag.exists():
         ui.ok(f"LLM provider configured: {default.model}")
-        if not ui.ask("Re-pick? [y/N]"):
+        if not ui.ask_no("Re-pick? [y/N]"):
             return True
 
     # Run the picker (writes to config.toml + drops .onboarded sentinel)
