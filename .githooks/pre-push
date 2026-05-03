@@ -69,9 +69,11 @@ done
 echo
 echo "── codex review done. Push? Ctrl+C to abort, anything else to continue. ──"
 # `while read` above consumed git's hook stdin; read from the controlling
-# terminal instead so the 10-second abort window actually exists.
-if [ -r /dev/tty ] && exec 3</dev/tty 2>/dev/null; then
-    read -r -t 10 -u 3 _ || true
-    exec 3<&-
-fi
+# terminal instead so the 10-second abort window actually exists. Wrap the
+# whole thing in a block that swallows stderr so non-tty environments
+# (Claude Code's bash, CI, certain editor terminals) don't spew
+# "/dev/tty: Device not configured" — they just silently skip the prompt.
+{
+    read -r -t 10 _ < /dev/tty || true
+} 2>/dev/null
 exit 0
