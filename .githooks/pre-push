@@ -38,9 +38,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     [[ "$local_sha" == "$remote_sha" ]] && continue
 
     if [[ "$remote_sha" == "$ZERO" ]]; then
-        # brand new branch — review last 10 commits as a sane window
-        base="$(git rev-list --max-count=10 "$local_sha" | tail -n 1)"
-        scope="new branch — last 10 commits up to $(git rev-parse --short "$local_sha")"
+        # Brand-new branch. We want diff = "all (up to 10) commits being
+        # pushed". `base..HEAD` is exclusive of base, so use the parent of
+        # the oldest selected commit. For a single-commit branch with no
+        # parent (genesis), fall back to git's empty-tree sentinel so the
+        # entire branch's content is included in the review diff.
+        oldest="$(git rev-list --max-count=10 "$local_sha" | tail -n 1)"
+        base="$(git rev-parse "${oldest}^" 2>/dev/null || true)"
+        if [ -z "${base:-}" ]; then
+            base="$(git hash-object -t tree /dev/null)"   # empty tree
+        fi
+        scope="new branch — up to last 10 commits ending at $(git rev-parse --short "$local_sha")"
     else
         base="$remote_sha"
         scope="$(git rev-parse --short "$base")..$(git rev-parse --short "$local_sha")"
@@ -56,5 +64,9 @@ done
 
 echo
 echo "── codex review done. Push? Ctrl+C to abort, anything else to continue. ──"
-read -r -t 10 -p "" _ || true   # 10s window to bail
+# `while read` above consumed git's hook stdin; read from the controlling
+# terminal instead so the 10-second abort window actually exists.
+if [ -r /dev/tty ]; then
+    read -r -t 10 -p "" _ < /dev/tty || true
+fi
 exit 0
