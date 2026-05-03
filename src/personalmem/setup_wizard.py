@@ -203,11 +203,17 @@ def check_llm_configured() -> bool:
         if not ui.ask_no("Re-pick? [y/N]"):
             return True
 
-    # Run the picker (writes to config.toml + drops .onboarded sentinel)
+    # Run the picker (writes to config.toml + drops .onboarded sentinel).
+    # Provider sub-flows (LM Studio not running, codex CLI not installed,
+    # PKCE timeout etc.) raise RuntimeError with their own user-facing
+    # message; surface those as a friendly fail rather than a traceback.
     try:
         ran = onboard.run_onboarding(force=True)
     except (KeyboardInterrupt, EOFError):
         ui.fail("onboarding cancelled")
+        return False
+    except RuntimeError as e:
+        ui.fail(f"onboarding aborted: {e}")
         return False
     if not ran:
         ui.fail("onboarding skipped (non-interactive shell?)")
