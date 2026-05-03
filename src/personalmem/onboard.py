@@ -1,28 +1,29 @@
 """Interactive onboarding: pick an LLM provider on first run.
 
-Menu options:
+Four options, two local + two OAuth:
 
-- **Ollama** — local, free. Probes ``http://localhost:11434``.
-- **API key** — Anthropic / OpenAI / Google Gemini / OpenRouter / Kimi.
-  All routed through litellm; OpenRouter and Kimi go via their
-  OpenAI-compatible endpoints with an explicit ``base_url``.
+- **Ollama** — local, free. Probes ``http://localhost:11434/api/tags``.
+- **LM Studio** — local, free, MLX-friendly. Probes
+  ``http://localhost:1234/v1/models`` (OpenAI-compatible server).
 - **Anthropic OAuth** — Claude.com Pro/Max subscription via PKCE.
   Tokens land in ``~/.personalmem/oauth-tokens.json`` (mode 0600); the
   LLM dispatcher auto-detects them when a Claude-family model has no
   ``api_key`` set.
+- **Codex OAuth** — ChatGPT Plus/Pro subscription. Delegates to the
+  ``codex login`` browser flow; tokens live in ``~/.codex/auth.json``.
+  Routes via ``llm/codex_oauth.py``.
 
 The chosen provider is written into ``[models.default]`` of
 ``~/.personalmem/config.toml`` (the rest of the file is preserved). A
 sentinel ``~/.personalmem/.onboarded`` marks the flow as done so future
 ``personalmem start`` invocations skip it.
 
-Re-run anytime with ``personalmem onboard``.
+Re-run anytime with ``personalmem setup`` (alias: ``personalmem onboard``).
 """
 
 from __future__ import annotations
 
 import base64
-import getpass
 import hashlib
 import http.server
 import json
@@ -55,55 +56,6 @@ _DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 _DEFAULT_OLLAMA_MODEL = "qwen2.5:14b"
 
 
-# API-key provider table. Mirrors GuardClaw's CloudJudge providers; all
-# entries map to litellm calls (OpenRouter and Kimi via OpenAI-compatible
-# base_url). ``key_hint`` shows expected prefix; ``key_prefix`` validates
-# (None to skip validation).
-_API_KEY_PROVIDERS: dict[str, dict[str, Any]] = {
-    "anthropic": {
-        "label": "Anthropic Claude",
-        "default_model": "anthropic/claude-haiku-4-5-20251001",
-        "key_hint": "sk-ant-...",
-        "key_prefix": "sk-ant-",
-        "extra": {},
-        "url": "https://console.anthropic.com/settings/keys",
-    },
-    "openai": {
-        "label": "OpenAI",
-        "default_model": "gpt-4o-mini",
-        "key_hint": "sk-...",
-        "key_prefix": "sk-",
-        "extra": {},
-        "url": "https://platform.openai.com/api-keys",
-    },
-    "gemini": {
-        "label": "Google Gemini",
-        "default_model": "gemini/gemini-2.0-flash",
-        "key_hint": "AIza...",
-        "key_prefix": "AIza",
-        "extra": {},
-        "url": "https://aistudio.google.com/apikey",
-    },
-    "openrouter": {
-        "label": "OpenRouter",
-        "default_model": "openrouter/anthropic/claude-haiku-4-5",
-        "key_hint": "sk-or-...",
-        "key_prefix": "sk-or-",
-        "extra": {},
-        "url": "https://openrouter.ai/keys",
-    },
-    "kimi": {
-        "label": "Kimi (Moonshot)",
-        # Use OpenAI-compatible client with explicit base_url.
-        "default_model": "openai/kimi-k2.5",
-        "key_hint": "sk-...",
-        "key_prefix": "sk-",
-        "extra": {"base_url": "https://api.moonshot.ai/v1"},
-        "url": "https://platform.moonshot.ai/console/api-keys",
-    },
-}
-
-
 # ─── Public entry points ─────────────────────────────────────────────────────
 
 
@@ -130,37 +82,26 @@ def run_onboarding(*, force: bool = False) -> bool:
     print()
     print("Pick an LLM provider for routing + summarization:")
     print()
-    print("  [1] Ollama          local, free, runs on your machine")
-    print("  [2] Anthropic OAuth Claude.com Pro/Max subscription (PKCE)")
-    print("  [3] Codex OAuth     ChatGPT Plus/Pro subscription (via codex CLI)")
-    print("  [4] Anthropic       API key  (sk-ant-...)")
-    print("  [5] OpenAI          API key  (sk-...)")
-    print("  [6] Google Gemini   API key  (AIza...)")
-    print("  [7] OpenRouter      API key  (sk-or-...)")
-    print("  [8] Kimi / Moonshot API key  (sk-...)")
+    print("  [1] Ollama          local, free  (probes localhost:11434)")
+    print("  [2] LM Studio       local, free  (probes localhost:1234, MLX-friendly)")
+    print("  [3] Anthropic OAuth Claude.com Pro/Max subscription (PKCE)")
+    print("  [4] Codex OAuth     ChatGPT Plus/Pro subscription (via codex CLI)")
     print()
 
-    api_key_choices = {
-        "4": "anthropic",
-        "5": "openai",
-        "6": "gemini",
-        "7": "openrouter",
-        "8": "kimi",
-    }
     while True:
-        choice = (input("Choice [1-8, default 1]: ").strip() or "1")
-        if choice in {"1", "2", "3"} or choice in api_key_choices:
+        choice = (input("Choice [1-4, default 1]: ").strip() or "1")
+        if choice in {"1", "2", "3", "4"}:
             break
-        print("  please enter 1-8")
+        print("  please enter 1-4")
 
     if choice == "1":
         block = _onboard_ollama()
     elif choice == "2":
-        block = _onboard_anthropic_oauth()
+        block = _onboard_lm_studio()
     elif choice == "3":
-        block = _onboard_codex_oauth()
+        block = _onboard_anthropic_oauth()
     else:
-        block = _onboard_api_key(api_key_choices[choice])
+        block = _onboard_codex_oauth()
 
     _write_models_default(block)
     flag.touch()
@@ -221,35 +162,64 @@ def _ollama_list_models() -> list[str] | None:
     return [m.get("name", "") for m in data.get("models") or [] if m.get("name")]
 
 
-# ─── Provider: API key (Anthropic / OpenAI / Gemini / OpenRouter / Kimi) ─────
+# ─── Provider: LM Studio ────────────────────────────────────────────────────
 
 
-def _onboard_api_key(provider_id: str) -> dict[str, Any]:
-    p = _API_KEY_PROVIDERS[provider_id]
+def _onboard_lm_studio() -> dict[str, Any]:
     print()
-    print(f"[{p['label']}]")
-    print(f"  Get a key at: {p['url']}")
+    print("[LM Studio] checking http://localhost:1234 ...")
+    models = _lm_studio_list_models()
+    if models is None:
+        print("  LM Studio server isn't running. Open the LM Studio app, go to")
+        print("  the Developer tab (left sidebar), toggle 'Status: Running on")
+        print("  port 1234', then re-run `personalmem setup` and pick this option.")
+        raise RuntimeError("LM Studio server not reachable on localhost:1234")
+    if not models:
+        print("  LM Studio is running but has no model loaded.")
+        print("  Pick a model in My Models → Load, then re-run.")
+        raise RuntimeError("LM Studio has no model loaded")
+    print(f"  Found {len(models)} loaded model(s):")
+    for i, m in enumerate(models, 1):
+        print(f"    [{i}] {m}")
     while True:
-        key = getpass.getpass(f"  Paste {p['key_hint']} (hidden): ").strip()
-        if not key:
-            print("  empty; try again")
-            continue
-        if p["key_prefix"] and not key.startswith(p["key_prefix"]):
-            print(f"  expected key starts with {p['key_prefix']!r}; try again")
-            continue
-        break
+        raw = input(f"  Pick [1-{len(models)}, default 1]: ").strip() or "1"
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(models):
+                chosen = models[idx]
+                break
+        except ValueError:
+            pass
+        print("  invalid selection")
 
-    print(f"  Default model: {p['default_model']}")
-    custom = input("  Override model name [enter to accept]: ").strip()
-    model = custom or p["default_model"]
-
-    block: dict[str, Any] = {
-        "model": model,
-        "api_key": key,
-        "max_tokens": 2048,
+    return {
+        # litellm routes openai/* with explicit base_url through its
+        # OpenAI-compatible client — what LM Studio's server speaks.
+        "model": f"openai/{chosen}",
+        "base_url": "http://localhost:1234/v1",
+        "api_key": "lm-studio",   # placeholder, LM Studio ignores it
+        "max_tokens": 4096,
     }
-    block.update(p["extra"])
-    return block
+
+
+def _lm_studio_list_models() -> list[str] | None:
+    """Return loaded model IDs, or None if the server isn't reachable.
+    LM Studio uses the OpenAI /v1/models shape: {"data": [{"id": ...}]}.
+    """
+    try:
+        with urllib.request.urlopen("http://localhost:1234/v1/models", timeout=2) as r:
+            data = json.loads(r.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return None
+    out = []
+    for m in data.get("data") or []:
+        mid = m.get("id") or ""
+        # Skip embedding models — they're not chat-capable
+        if "embed" in mid.lower():
+            continue
+        if mid:
+            out.append(mid)
+    return out
 
 
 # ─── Provider: Codex OAuth (ChatGPT Plus/Pro via codex CLI) ─────────────────
