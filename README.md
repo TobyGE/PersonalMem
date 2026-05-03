@@ -8,6 +8,7 @@ macOS daemon that turns your day's screen activity into topic-organized Markdown
 git clone https://github.com/TobyGE/PersonalMem.git ~/PersonalMem
 cd ~/PersonalMem
 uv tool install --editable .
+git config core.hooksPath .githooks   # opt in to advisory pre-push codex review
 personalmem start          # foreground (-f) the first time to grant Screen Recording perm
 ```
 
