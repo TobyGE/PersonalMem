@@ -44,7 +44,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         # parent (genesis), fall back to git's empty-tree sentinel so the
         # entire branch's content is included in the review diff.
         oldest="$(git rev-list --max-count=10 "$local_sha" | tail -n 1)"
-        base="$(git rev-parse "${oldest}^" 2>/dev/null || true)"
+        # `git rev-parse` (without --verify) prints the literal arg on
+        # failure, so an invalid `oldest^` would still set base to a
+        # bogus non-empty string. --verify suppresses output on failure
+        # and exits non-zero.
+        base="$(git rev-parse --verify "${oldest}^" 2>/dev/null || true)"
         if [ -z "${base:-}" ]; then
             base="$(git hash-object -t tree /dev/null)"   # empty tree
         fi
@@ -66,7 +70,8 @@ echo
 echo "── codex review done. Push? Ctrl+C to abort, anything else to continue. ──"
 # `while read` above consumed git's hook stdin; read from the controlling
 # terminal instead so the 10-second abort window actually exists.
-if [ -r /dev/tty ]; then
-    read -r -t 10 -p "" _ < /dev/tty || true
+if [ -r /dev/tty ] && exec 3</dev/tty 2>/dev/null; then
+    read -r -t 10 -u 3 _ || true
+    exec 3<&-
 fi
 exit 0
