@@ -918,6 +918,8 @@ def cmd_threads_cleanup(args) -> int:
     grown past the working set you want the router to see."""
     cfg = oc_config.load(Path(args.config).expanduser() if args.config else None)
     out_path = Path(cfg.storage.threads_db).expanduser()
+    in_path = Path(cfg.source.index_db).expanduser()
+    out_dir = Path(cfg.storage.out_dir).expanduser()
     if not out_path.exists():
         print(f"no threads db at {out_path}", file=sys.stderr)
         return 1
@@ -928,6 +930,33 @@ def cmd_threads_cleanup(args) -> int:
     if mode not in ("archive", "delete"):
         print(f"invalid mode: {mode!r} (expected 'archive' or 'delete')", file=sys.stderr)
         return 2
+
+    # Flush ALL current threads to .md before eviction. `cmd_run` does this
+    # via `write_thread_mds` immediately before cleanup, so the auto-trim
+    # path is safe — but the manual command historically jumped straight
+    # to cleanup, which could hard-delete (mode="delete") thread rows whose
+    # .md had never been written or was stale. We flush unconditionally
+    # since the cost is small (no LLM calls — purely reads cached
+    # narratives from the thread row) and it guarantees every evicted
+    # thread has an up-to-date archive on disk.
+    if not in_path.exists():
+        print(f"no index db at {in_path} — can't flush .md before cleanup",
+              file=sys.stderr)
+        return 1
+    in_conn = open_input_db(in_path)
+    print("flushing thread .md before cleanup...", file=sys.stderr)
+    write_thread_mds(in_conn=in_conn, out_conn=out_conn,
+                     out_dir=out_dir, buffer_dir=Path(cfg.source.capture_buffer_dir).expanduser())
+    # Mirror to vault if configured, same as cmd_run does — the manual
+    # cleanup user expects their Obsidian copy to reflect what's about
+    # to be evicted just as much as the auto path does.
+    mirror = (cfg.storage.vault_mirror_dir or "").strip()
+    if mirror:
+        import shutil
+        mp = Path(mirror).expanduser()
+        mp.mkdir(parents=True, exist_ok=True)
+        for src in list(out_dir.glob("*.md")):
+            shutil.copy2(src, mp / src.name)
 
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     stats = cleanup_threads_lru(out_conn, keep_n=keep_n, mode=mode, at=now)
