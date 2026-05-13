@@ -931,32 +931,46 @@ def cmd_threads_cleanup(args) -> int:
         print(f"invalid mode: {mode!r} (expected 'archive' or 'delete')", file=sys.stderr)
         return 2
 
-    # Flush ALL current threads to .md before eviction. `cmd_run` does this
-    # via `write_thread_mds` immediately before cleanup, so the auto-trim
-    # path is safe — but the manual command historically jumped straight
-    # to cleanup, which could hard-delete (mode="delete") thread rows whose
-    # .md had never been written or was stale. We flush unconditionally
-    # since the cost is small (no LLM calls — purely reads cached
-    # narratives from the thread row) and it guarantees every evicted
-    # thread has an up-to-date archive on disk.
-    if not in_path.exists():
-        print(f"no index db at {in_path} — can't flush .md before cleanup",
-              file=sys.stderr)
+    # Best-effort flush ALL current threads to .md before eviction.
+    # `cmd_run`'s auto-trim path always writes .md first via
+    # `write_thread_mds`, but the manual command historically didn't —
+    # so a hard `--mode delete` could remove DB rows before their .md
+    # had been written. Resolution depends on mode:
+    #   - delete  → flush is required (else data loss); abort if the
+    #               source index DB isn't reachable.
+    #   - archive → flush is best-effort (rows + capture joins stay in
+    #               threads_db, so nothing is unrecoverable); skip with
+    #               a warning if index DB is missing.
+    if in_path.exists():
+        in_conn = open_input_db(in_path)
+        print("flushing thread .md before cleanup...", file=sys.stderr)
+        write_thread_mds(
+            in_conn=in_conn, out_conn=out_conn,
+            out_dir=out_dir,
+            buffer_dir=Path(cfg.source.capture_buffer_dir).expanduser(),
+        )
+        mirror = (cfg.storage.vault_mirror_dir or "").strip()
+        if mirror:
+            import shutil
+            mp = Path(mirror).expanduser()
+            mp.mkdir(parents=True, exist_ok=True)
+            for src in list(out_dir.glob("*.md")):
+                shutil.copy2(src, mp / src.name)
+    elif mode == "delete":
+        print(
+            f"refusing to delete: no index db at {in_path} — can't flush "
+            f"thread .md as a safety archive. Re-run with --mode archive or "
+            f"restore the source DB.",
+            file=sys.stderr,
+        )
         return 1
-    in_conn = open_input_db(in_path)
-    print("flushing thread .md before cleanup...", file=sys.stderr)
-    write_thread_mds(in_conn=in_conn, out_conn=out_conn,
-                     out_dir=out_dir, buffer_dir=Path(cfg.source.capture_buffer_dir).expanduser())
-    # Mirror to vault if configured, same as cmd_run does — the manual
-    # cleanup user expects their Obsidian copy to reflect what's about
-    # to be evicted just as much as the auto path does.
-    mirror = (cfg.storage.vault_mirror_dir or "").strip()
-    if mirror:
-        import shutil
-        mp = Path(mirror).expanduser()
-        mp.mkdir(parents=True, exist_ok=True)
-        for src in list(out_dir.glob("*.md")):
-            shutil.copy2(src, mp / src.name)
+    else:  # archive mode, source DB unreachable
+        print(
+            f"warning: no index db at {in_path} — skipping .md flush. "
+            f"Archive is non-destructive so this is safe; the .md files "
+            f"on disk just won't be re-rendered with latest summaries.",
+            file=sys.stderr,
+        )
 
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     stats = cleanup_threads_lru(out_conn, keep_n=keep_n, mode=mode, at=now)
