@@ -23,6 +23,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -160,3 +161,70 @@ def call_codex_oauth(
             raise
 
     raise RuntimeError(f"Codex OAuth: all retries exhausted") from last_exc
+
+
+def stream_codex_oauth(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+) -> Iterator[str]:
+    """Streaming variant: yield text deltas as they arrive over SSE.
+
+    For Q&A / chat surfaces where we want token-by-token output instead
+    of waiting for the full response. Retries are NOT done here — a
+    stream that fails mid-flight would have to be restarted from scratch,
+    losing yielded prefix; callers wrap with their own retry if needed.
+    """
+    auth = auth_mod.load_codex_tokens()
+    tokens = auth.get("tokens") or {}
+    access = tokens.get("access_token")
+    account_id = tokens.get("account_id")
+    if not access or not account_id:
+        raise RuntimeError(
+            f"{auth_mod.CODEX_AUTH_FILE} is missing access_token / account_id. "
+            "Run `codex login` to refresh."
+        )
+
+    instructions, user_input = _extract_system_and_user(messages)
+    payload = {
+        "model": model or _DEFAULT_MODEL,
+        "instructions": instructions or "You are a helpful assistant.",
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": user_input},
+        ]}],
+        "stream": True,
+        "store": False,
+    }
+    body = json.dumps(payload).encode()
+    headers = {
+        "Authorization": f"Bearer {access}",
+        "Content-Type": "application/json",
+        "chatgpt-account-id": account_id,
+        "Accept": "text/event-stream",
+        "OpenAI-Beta": "responses=v1",
+    }
+
+    req = urllib.request.Request(_URL, data=body, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            for line in r:
+                s = line.decode().rstrip()
+                if not s.startswith("data: "):
+                    continue
+                d = json.loads(s[6:])
+                t = d.get("type")
+                if t == "response.output_text.delta":
+                    delta = d.get("delta", "")
+                    if delta:
+                        yield delta
+                elif t == "response.completed":
+                    return
+                elif t == "response.failed":
+                    raise RuntimeError(f"response.failed: {d}")
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode()[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"Codex OAuth HTTP {e.code}: {err_body}") from e

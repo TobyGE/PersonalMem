@@ -25,7 +25,7 @@ import signal
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config as oc_config
@@ -178,6 +178,7 @@ def run_routing(
     sub_context_for: dict[str, str] | None = None,
     buffer_dir: Path | None = None,
     folded_for_kept: dict[str, list[str]] | None = None,
+    out_dir: Path | None = None,    # if set, live-write affected thread .md after each route
 ) -> dict:
     sub_context_for = sub_context_for or {}
     folded_for_kept = folded_for_kept or {}
@@ -323,6 +324,14 @@ def run_routing(
                     key_events=summary.key_events,
                     outcome=summary.outcome,
                 )
+                # Live-write this one thread's .md so users tailing the
+                # output dir (Obsidian / `watch ls`) see progress in
+                # near-real-time instead of waiting for end-of-run.
+                _write_one_thread_md(
+                    target, in_conn=in_conn, out_conn=out_conn,
+                    out_dir=out_dir, buffer_dir=buffer_dir,
+                    mirror_dir=cfg.storage.vault_mirror_dir,
+                )
         except Exception as e:  # noqa: BLE001
             print(f"  ! incremental summarize error: {e}", file=sys.stderr)
 
@@ -354,11 +363,106 @@ def run_routing(
 # ─── summarization + md rendering ──────────────────────────────────────────
 
 
+def _write_one_thread_md(
+    thread_id: str, *, in_conn, out_conn, out_dir, buffer_dir,
+    mirror_dir: str = "",
+) -> None:
+    """Write the .md for a single thread (and mirror to vault if set).
+
+    Used during routing for live progress: after each capture's
+    incremental summarize, the just-touched thread's .md is rewritten
+    so a watcher / Obsidian sees fresh content without waiting for
+    end-of-run. No LLM call here — reads cached fields off the thread
+    row.
+    """
+    if out_dir is None:
+        return
+    import json as _json
+    from pathlib import Path as _Path
+    out_dir = _Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    r = out_conn.execute(
+        "SELECT id, title, opened_at, closed_at, last_active_at, "
+        "       narrative, key_events_json, outcome "
+        "  FROM threads WHERE id = ?", (thread_id,),
+    ).fetchone()
+    if r is None:
+        return
+    cap_ids = thread_store.thread_capture_ids(out_conn, thread_id)
+    if not cap_ids:
+        return
+    placeholders = ",".join("?" * len(cap_ids))
+    cap_rows = in_conn.execute(
+        "SELECT id, timestamp, app_name, bundle_id, window_title, "
+        "       focused_role, focused_value, visible_text, url "
+        f"  FROM captures WHERE id IN ({placeholders}) "
+        " ORDER BY timestamp ASC",
+        cap_ids,
+    ).fetchall()
+    captures = [row_to_view(cr) for cr in cap_rows]
+
+    try:
+        key_events = _json.loads(r["key_events_json"] or "[]")
+        if not isinstance(key_events, list):
+            key_events = []
+    except (TypeError, ValueError):
+        key_events = []
+
+    md = _render_thread_md(
+        tid=thread_id, title=r["title"],
+        opened_at=r["opened_at"],
+        closed_at=r["closed_at"] or r["last_active_at"],
+        narrative=r["narrative"] or "",
+        outcome=r["outcome"] or "",
+        key_events=key_events,
+        captures=captures,
+        buffer_dir=buffer_dir,
+    )
+    md_path = out_dir / f"{thread_id}.md"
+    md_path.write_text(md)
+
+    if mirror_dir:
+        import shutil
+        m = _Path(mirror_dir).expanduser()
+        m.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(md_path, m / md_path.name)
+
+
 def close_remaining(out_conn: sqlite3.Connection, *, closed_at: str) -> int:
     threads = thread_store.list_open_threads(out_conn)
     for t in threads:
         thread_store.close_thread(out_conn, thread_id=t.id, closed_at=closed_at)
     return len(threads)
+
+
+def cleanup_threads_lru(
+    out_conn: sqlite3.Connection, *,
+    keep_n: int, mode: str, at: str,
+) -> dict:
+    """LRU eviction. Caller is expected to have already flushed each
+    thread's .md to disk (so archived/deleted threads have a final
+    record in the vault). Returns counts so the run report can include
+    eviction stats.
+    """
+    active_before = thread_store.count_active_threads(out_conn)
+    if active_before <= keep_n:
+        return {
+            "mode": mode, "keep_n": keep_n,
+            "active_before": active_before, "evicted": 0,
+            "active_after": active_before,
+        }
+    victims = thread_store.archive_threads_lru(
+        out_conn, keep_n=keep_n, archived_at=at,
+    )
+    if mode == "delete" and victims:
+        thread_store.delete_threads(out_conn, victims)
+    active_after = thread_store.count_active_threads(out_conn)
+    return {
+        "mode": mode, "keep_n": keep_n,
+        "active_before": active_before, "evicted": len(victims),
+        "active_after": active_after,
+    }
 
 
 def write_thread_mds(
@@ -592,6 +696,7 @@ def cmd_run(args) -> int:
         sub_context_for=sub_context_for,
         buffer_dir=buffer_dir,
         folded_for_kept=folded_for_kept,
+        out_dir=out_dir,
     )
     routing_stats["routing_seconds"] = round(time.monotonic() - t0, 1)
 
@@ -607,6 +712,26 @@ def cmd_run(args) -> int:
     )
     summary_stats["summary_seconds"] = round(time.monotonic() - t2, 1)
 
+    # LRU cleanup: bound the active candidate pool the router sees on
+    # future runs. `.md` for every current thread was just written above,
+    # so archived/deleted threads still have a vault record.
+    cleanup_stats: dict | None = None
+    if cfg.cleanup.auto_trim:
+        cleanup_stats = cleanup_threads_lru(
+            out_conn,
+            keep_n=cfg.cleanup.max_active_threads,
+            mode=cfg.cleanup.mode,
+            at=last_ts,
+        )
+        if cleanup_stats["evicted"]:
+            print(
+                f"cleanup ({cleanup_stats['mode']}): "
+                f"{cleanup_stats['active_before']} → "
+                f"{cleanup_stats['active_after']} active threads "
+                f"({cleanup_stats['evicted']} evicted, keep_n={cleanup_stats['keep_n']})",
+                file=sys.stderr,
+            )
+
     report = {
         "input_db": str(in_path),
         "threads_db": str(out_path),
@@ -620,6 +745,7 @@ def cmd_run(args) -> int:
         },
         "routing": routing_stats,
         "summary": summary_stats,
+        "cleanup": cleanup_stats,
     }
     (out_dir / "_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
     print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -639,6 +765,185 @@ def cmd_run(args) -> int:
             shutil.copy2(src, mirror_path / src.name)
             copied += 1
         print(f"mirrored {copied} files → {mirror_path}", file=sys.stderr)
+    return 0
+
+
+def cmd_ask(args) -> int:
+    """One-shot Q&A. Streams answer; expands citations at end."""
+    cfg = oc_config.load(Path(args.config).expanduser() if args.config else None)
+    out_path = Path(cfg.storage.threads_db).expanduser()
+    in_path = Path(cfg.source.index_db).expanduser()
+    out_dir = Path(cfg.storage.out_dir).expanduser()
+    if not out_path.exists():
+        print(f"no threads db at {out_path} — run `personalmem run` first",
+              file=sys.stderr)
+        return 1
+
+    out_conn = open_replay_db(out_path)
+    in_conn = open_input_db(in_path) if in_path.exists() else None
+    question = " ".join(args.question).strip()
+    if not question:
+        print("usage: personalmem ask \"<your question>\"", file=sys.stderr)
+        return 2
+
+    from . import qa
+    text_parts: list[str] = []
+    try:
+        for delta in qa.ask_stream(
+            cfg,
+            out_conn=out_conn, in_conn=in_conn,
+            question=question,
+            since=args.since,
+            until=args.until,
+            max_threads=args.max_threads,
+        ):
+            sys.stdout.write(delta)
+            sys.stdout.flush()
+            text_parts.append(delta)
+    except KeyboardInterrupt:
+        print("\n[interrupted]", file=sys.stderr)
+        return 130
+    except Exception as e:  # noqa: BLE001
+        print(f"\n[error] {e}", file=sys.stderr)
+        return 1
+
+    full_text = "".join(text_parts)
+    sources_block = qa.expand_thread_citations(full_text, out_dir=out_dir)
+    appended = sources_block[len(full_text):]
+    if appended:
+        sys.stdout.write(appended)
+        sys.stdout.flush()
+    print()
+    return 0
+
+
+def cmd_chat(args) -> int:
+    """Multi-turn REPL over thread memory.
+
+    History accumulates locally and is re-sent on every turn (the Codex
+    OAuth backend uses ``store=false``, so the server never retains state).
+    Commands prefixed with ``/`` are intercepted client-side.
+    """
+    cfg = oc_config.load(Path(args.config).expanduser() if args.config else None)
+    out_path = Path(cfg.storage.threads_db).expanduser()
+    in_path = Path(cfg.source.index_db).expanduser()
+    out_dir = Path(cfg.storage.out_dir).expanduser()
+    if not out_path.exists():
+        print(f"no threads db at {out_path} — run `personalmem run` first",
+              file=sys.stderr)
+        return 1
+
+    out_conn = open_replay_db(out_path)
+    in_conn = open_input_db(in_path) if in_path.exists() else None
+
+    active_n = thread_store.count_active_threads(out_conn)
+    qa_cfg = cfg.models.get("qa")
+    qa_model = (qa_cfg.model if qa_cfg and qa_cfg.model else "gpt-5.5 (Codex OAuth)")
+    print(f"PersonalMem chat · model={qa_model} · {active_n} active threads",
+          file=sys.stderr)
+    print("Commands: /exit, /clear, /threads [N], /help", file=sys.stderr)
+    print("---", file=sys.stderr)
+
+    from . import qa
+    history: list[tuple[str, str]] = []
+
+    while True:
+        try:
+            line = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not line:
+            continue
+
+        if line.startswith("/"):
+            parts = line.split()
+            cmd = parts[0].lower()
+            if cmd in ("/exit", "/quit", "/q"):
+                return 0
+            if cmd in ("/help", "/h", "/?"):
+                print("  /exit            quit the chat", file=sys.stderr)
+                print("  /clear           reset conversation history", file=sys.stderr)
+                print("  /threads [N]     list top-N active threads (default 20)",
+                      file=sys.stderr)
+                print("  /help            show this", file=sys.stderr)
+                continue
+            if cmd == "/clear":
+                history = []
+                print("[history cleared]", file=sys.stderr)
+                continue
+            if cmd == "/threads":
+                n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 20
+                tlist = thread_store.list_recent_threads(out_conn, top_k=n)
+                for t in tlist:
+                    cnt = thread_store.thread_capture_count(out_conn, t.id)
+                    print(f"  [{cnt:>4}] {t.id}  {t.title[:70]}", file=sys.stderr)
+                continue
+            print(f"unknown command: {cmd} (try /help)", file=sys.stderr)
+            continue
+
+        text_parts: list[str] = []
+        try:
+            for delta in qa.ask_stream(
+                cfg,
+                out_conn=out_conn, in_conn=in_conn,
+                question=line, history=history,
+            ):
+                sys.stdout.write(delta)
+                sys.stdout.flush()
+                text_parts.append(delta)
+        except KeyboardInterrupt:
+            print("\n[interrupted; partial response discarded from history]",
+                  file=sys.stderr)
+            continue
+        except Exception as e:  # noqa: BLE001
+            print(f"\n[error] {e}", file=sys.stderr)
+            continue
+
+        full_text = "".join(text_parts)
+        sources_block = qa.expand_thread_citations(full_text, out_dir=out_dir)
+        appended = sources_block[len(full_text):]
+        if appended:
+            sys.stdout.write(appended)
+            sys.stdout.flush()
+        print()
+        history.append(("user", line))
+        history.append(("assistant", full_text))
+
+
+def cmd_threads_cleanup(args) -> int:
+    """Manual LRU cleanup: archive (default) or delete the least-recently-
+    active threads beyond ``--keep N``. Useful for catching up after a long
+    run on a fresh install, or when ``auto_trim`` is off and the DB has
+    grown past the working set you want the router to see."""
+    cfg = oc_config.load(Path(args.config).expanduser() if args.config else None)
+    out_path = Path(cfg.storage.threads_db).expanduser()
+    if not out_path.exists():
+        print(f"no threads db at {out_path}", file=sys.stderr)
+        return 1
+    out_conn = open_replay_db(out_path)
+
+    keep_n = args.keep if args.keep is not None else cfg.cleanup.max_active_threads
+    mode = args.mode or cfg.cleanup.mode
+    if mode not in ("archive", "delete"):
+        print(f"invalid mode: {mode!r} (expected 'archive' or 'delete')", file=sys.stderr)
+        return 2
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    stats = cleanup_threads_lru(out_conn, keep_n=keep_n, mode=mode, at=now)
+
+    print(json.dumps(stats, indent=2, ensure_ascii=False))
+    if stats["evicted"] == 0:
+        print(
+            f"no eviction needed: {stats['active_before']} active ≤ keep_n={keep_n}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"{mode}d {stats['evicted']} threads "
+            f"({stats['active_before']} → {stats['active_after']} active)",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -840,6 +1145,36 @@ def main() -> int:
     sp_run.add_argument("--reset", action="store_true",
                         help="wipe threads_db before this run")
     sp_run.set_defaults(func=cmd_run)
+
+    sp_ask = sub.add_parser(
+        "ask",
+        help='one-shot Q&A: `personalmem ask "what was I doing yesterday at 3pm"`',
+    )
+    sp_ask.add_argument("question", nargs="+",
+                        help="natural-language question; quoting optional")
+    sp_ask.add_argument("--since", default=None,
+                        help="ISO timestamp lower bound on thread last_active_at")
+    sp_ask.add_argument("--until", default=None,
+                        help="ISO timestamp upper bound on thread opened_at")
+    sp_ask.add_argument("--max-threads", type=int, default=None,
+                        help="cap on threads sent to the LLM (default: all active)")
+    sp_ask.set_defaults(func=cmd_ask)
+
+    sp_chat = sub.add_parser("chat", help="interactive Q&A REPL with conversation history")
+    sp_chat.set_defaults(func=cmd_chat)
+
+    sp_threads = sub.add_parser("threads", help="manage threads")
+    sub_threads = sp_threads.add_subparsers(dest="threads_cmd", metavar="{cleanup}")
+    sub_threads.required = True
+    sp_th_cl = sub_threads.add_parser(
+        "cleanup",
+        help="LRU eviction: archive (default) or delete least-recently-active threads",
+    )
+    sp_th_cl.add_argument("--keep", type=int, default=None,
+                          help="cap on active threads (default: cleanup.max_active_threads)")
+    sp_th_cl.add_argument("--mode", choices=["archive", "delete"], default=None,
+                          help="archive (soft, default) or delete (hard, irreversible)")
+    sp_th_cl.set_defaults(func=cmd_threads_cleanup)
 
     sp_init = sub.add_parser("init", help="write default config.toml")
     sp_init.add_argument("--force", action="store_true")

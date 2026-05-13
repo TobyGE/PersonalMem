@@ -85,6 +85,26 @@ class CaptureSourceConfig:
 
 
 @dataclass
+class CleanupConfig:
+    """LRU thread-pool eviction. Bounds the router's candidate set so
+    prompt size stays predictable as the DB ages — without losing the
+    archive: evicted threads remain queryable in the DB and their final
+    .md is already in the vault."""
+    # Hard cap on active (non-archived) threads. Eviction triggers when
+    # the active count exceeds this number; the (active - max) least-
+    # recently-active threads are archived first.
+    max_active_threads: int = 200
+    # Run cleanup automatically at the end of each `personalmem run`.
+    # Manual cleanup is always available via `personalmem threads cleanup`.
+    auto_trim: bool = True
+    # 'archive' (soft, default): set threads.archived_at; rows preserved,
+    #                            router skips them, vault .md untouched.
+    # 'delete'  (hard): drop threads + thread_captures rows. Vault .md is
+    #                   the only surviving record. Irreversible.
+    mode: str = "archive"
+
+
+@dataclass
 class StorageConfig:
     """Where PersonalMem writes its own state."""
     threads_db: str = "~/.personalmem/threads.db"
@@ -103,6 +123,7 @@ class Config:
     capture: CaptureConfig = field(default_factory=CaptureConfig)
     coalesce: CoalesceConfig = field(default_factory=CoalesceConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
+    cleanup: CleanupConfig = field(default_factory=CleanupConfig)
     source: CaptureSourceConfig = field(default_factory=CaptureSourceConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
 
@@ -156,6 +177,7 @@ def load(path: Path | None = None) -> Config:
         capture=_build(CaptureConfig, _as_dict(raw.get("capture"))),
         coalesce=_build(CoalesceConfig, _as_dict(raw.get("coalesce"))),
         router=_build(RouterConfig, _as_dict(raw.get("router"))),
+        cleanup=_build(CleanupConfig, _as_dict(raw.get("cleanup"))),
         source=_build(CaptureSourceConfig, _as_dict(raw.get("source"))),
         storage=_build(StorageConfig, _as_dict(raw.get("storage"))),
     )
@@ -230,6 +252,15 @@ gap_seconds = 60
 
 [router]
 top_k = 10
+
+# LRU eviction: bound the router's candidate set so prompt size stays
+# predictable. Eviction triggers when active thread count exceeds
+# `max_active_threads`. Archived threads (.md already in vault) are
+# skipped by the router but kept in the DB.
+[cleanup]
+max_active_threads = 200
+auto_trim = true        # run cleanup after each `personalmem run`
+mode = "archive"        # "archive" (soft, default) | "delete" (hard)
 
 # ─── Data source: where raw AX captures live ──────────────────────────────
 # By default reads from PersonalMem's own daemon. Point at another

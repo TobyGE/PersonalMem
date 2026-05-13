@@ -27,10 +27,12 @@ CREATE TABLE IF NOT EXISTS threads (
     summary TEXT,                          -- legacy alias of narrative; kept for back-compat
     narrative TEXT,                        -- summarizer-generated running narrative
     key_events_json TEXT,                  -- JSON array of bullet strings
-    outcome TEXT
+    outcome TEXT,
+    archived_at TEXT                       -- LRU eviction timestamp; NULL = active
 );
 
 CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status, last_active_at);
+CREATE INDEX IF NOT EXISTS idx_threads_archived ON threads(archived_at, last_active_at);
 
 CREATE TABLE IF NOT EXISTS thread_captures (
     thread_id TEXT NOT NULL,
@@ -45,14 +47,29 @@ CREATE INDEX IF NOT EXISTS idx_thread_captures_capture ON thread_captures(captur
 
 
 def _ensure_columns(conn: sqlite3.Connection) -> None:
-    """Lightweight migrations for older dbs."""
-    tc_cols = [r[1] for r in conn.execute("PRAGMA table_info(thread_captures)")]
-    if "description" not in tc_cols:
-        conn.execute("ALTER TABLE thread_captures ADD COLUMN description TEXT")
-    t_cols = [r[1] for r in conn.execute("PRAGMA table_info(threads)")]
-    for col in ("narrative", "key_events_json", "outcome"):
-        if col not in t_cols:
-            conn.execute(f"ALTER TABLE threads ADD COLUMN {col} TEXT")
+    """Lightweight migrations for older dbs.
+
+    Skips silently when a table doesn't exist yet — on a fresh DB this
+    runs before ``CREATE TABLE`` (so the schema script can safely create
+    indexes that reference the up-to-date column set), but PRAGMA would
+    return an empty column list and we'd try to ALTER a non-existent
+    table. The schema script that runs immediately after will create
+    the tables with all columns present, so the no-op here is correct.
+    """
+    tables = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "thread_captures" in tables:
+        tc_cols = [r[1] for r in conn.execute("PRAGMA table_info(thread_captures)")]
+        if "description" not in tc_cols:
+            conn.execute("ALTER TABLE thread_captures ADD COLUMN description TEXT")
+    if "threads" in tables:
+        t_cols = [r[1] for r in conn.execute("PRAGMA table_info(threads)")]
+        for col in ("narrative", "key_events_json", "outcome", "archived_at"):
+            if col not in t_cols:
+                conn.execute(f"ALTER TABLE threads ADD COLUMN {col} TEXT")
 
 
 @dataclass
@@ -67,11 +84,17 @@ class Thread:
     narrative: str | None = None
     key_events_json: str | None = None
     outcome: str | None = None
+    archived_at: str | None = None
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA)
+    # Order matters: migrate columns on the existing table FIRST (no-op
+    # on a fresh DB where the table doesn't exist yet), THEN run the
+    # schema script. The schema's CREATE INDEX on archived_at would
+    # otherwise fail against an old `threads` table that predates the
+    # column.
     _ensure_columns(conn)
+    conn.executescript(SCHEMA)
 
 
 def new_thread_id() -> str:
@@ -162,23 +185,81 @@ def list_open_threads(
 
 
 def list_recent_threads(
-    conn: sqlite3.Connection, *, top_k: int | None = None
+    conn: sqlite3.Connection, *,
+    top_k: int | None = None,
+    include_archived: bool = False,
 ) -> list[Thread]:
-    """All threads ordered by recency, regardless of open/closed status.
+    """Threads ordered by recency, regardless of open/closed status.
 
     Threads represent topics, not time blocks — a sleeping thread can be
     resumed when a related capture arrives, even hours/days later. The router
     sees the top-K most-recently-active threads in its prompt; threads
     outside the window aren't visible THIS routing decision but stay in the
     DB and can resurface later if their app/topic returns to the top-K.
+
+    By default (``include_archived=False``), LRU-evicted threads are
+    excluded — they should NOT be candidates for continuation by the
+    router. But Q&A / search surfaces SHOULD see them (that's the point
+    of the archive: long-term recall without polluting the active pool)
+    — pass ``include_archived=True`` for those callers.
     """
-    sql = "SELECT * FROM threads ORDER BY last_active_at DESC"
+    if include_archived:
+        sql = "SELECT * FROM threads ORDER BY last_active_at DESC"
+    else:
+        sql = (
+            "SELECT * FROM threads WHERE archived_at IS NULL "
+            "ORDER BY last_active_at DESC"
+        )
     args: list = []
     if top_k is not None:
         sql += " LIMIT ?"
         args.append(top_k)
     rows = conn.execute(sql, args).fetchall()
     return [_row_to_thread(r) for r in rows]
+
+
+def count_active_threads(conn: sqlite3.Connection) -> int:
+    r = conn.execute(
+        "SELECT COUNT(*) AS c FROM threads WHERE archived_at IS NULL"
+    ).fetchone()
+    return r["c"] if isinstance(r, sqlite3.Row) else r[0]
+
+
+def archive_threads_lru(
+    conn: sqlite3.Connection, *, keep_n: int, archived_at: str,
+) -> list[str]:
+    """Soft-archive least-recently-active threads beyond ``keep_n``.
+
+    Returns the list of archived thread IDs. The router's candidate pool
+    (``list_recent_threads``) skips ``archived_at IS NOT NULL`` rows, so
+    archived threads can't accidentally get new captures appended — but
+    their rows and ``thread_captures`` join entries are preserved, leaving
+    the door open for un-archive / inspection / cleanup-mode=delete later.
+    """
+    rows = conn.execute(
+        "SELECT id FROM threads "
+        " WHERE archived_at IS NULL "
+        " ORDER BY last_active_at DESC"
+    ).fetchall()
+    if len(rows) <= keep_n:
+        return []
+    victims = [r["id"] if isinstance(r, sqlite3.Row) else r[0] for r in rows[keep_n:]]
+    ph = ",".join("?" * len(victims))
+    conn.execute(
+        f"UPDATE threads SET archived_at = ? WHERE id IN ({ph})",
+        (archived_at, *victims),
+    )
+    return victims
+
+
+def delete_threads(conn: sqlite3.Connection, thread_ids: list[str]) -> None:
+    """Hard-delete thread rows + their join rows. Vault .md is the only
+    surviving record. Used by cleanup mode='delete' (irreversible)."""
+    if not thread_ids:
+        return
+    ph = ",".join("?" * len(thread_ids))
+    conn.execute(f"DELETE FROM thread_captures WHERE thread_id IN ({ph})", thread_ids)
+    conn.execute(f"DELETE FROM threads WHERE id IN ({ph})", thread_ids)
 
 
 def get_thread(conn: sqlite3.Connection, thread_id: str) -> Thread | None:
@@ -213,6 +294,7 @@ def _row_to_thread(r) -> Thread:
         narrative=_safe_col(r, "narrative"),
         key_events_json=_safe_col(r, "key_events_json"),
         outcome=_safe_col(r, "outcome"),
+        archived_at=_safe_col(r, "archived_at"),
     )
 
 
